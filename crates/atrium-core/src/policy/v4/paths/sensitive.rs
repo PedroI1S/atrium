@@ -2049,7 +2049,7 @@ impl RootAliases {
 /// unless a hard-deny hit was found, the scan's reason for doubt (an
 /// incomplete table, an unreadable ancestor) as Unread beside any Store hit
 /// (§1, §8; review 7, finding 3). Variant-only matches are never hits.
-pub(crate) fn push_alias_records(
+fn push_alias_records(
     target: &Target,
     protected: &ProtectedSet,
     resolver: &dyn PathResolver,
@@ -2152,7 +2152,18 @@ pub(crate) fn push_target_records(
     outcomes: &mut Vec<PartResult>,
     keep_clear: bool,
 ) -> Result<(), Exhausted> {
+    let start = outcomes.len();
     check_target_into(target, protected, budget, outcomes, keep_clear)?;
+    // Once this target has a HardDenyHit, skip alias scanning so an incomplete
+    // alias table never attaches a spurious Unread alongside a definitive hit
+    // (contract §1, §5; ProtectedSet::identity_gaps; D-144, D-145; review 7
+    // finding 3).
+    if outcomes[start..]
+        .iter()
+        .any(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
+    {
+        return Ok(());
+    }
     push_alias_records(target, protected, resolver, caps, budget, aliases, outcomes)
 }
 

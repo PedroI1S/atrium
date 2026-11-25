@@ -17,9 +17,9 @@ use crate::policy::v4::paths::PathResolver;
 use crate::policy::v4::paths::resolve::{join_bytes, resolve_literal_impl};
 use crate::policy::v4::paths::sensitive::{
     ASK_FILES, ASK_NAME_PREFIXES, ASK_TREES, BROWSER_FILES, BROWSER_ROOTS, CRED_FILES, CRED_TREES,
-    RootAliases, SharedSensitive, check_target_into, extend_charged, fold_listed_component,
-    fold_path_listed, join_folded, origin_to_part, other_spellings, push_alias_records,
-    push_charged, push_target_records, under_bytes, under_str,
+    RootAliases, SharedSensitive, extend_charged, fold_listed_component, fold_path_listed,
+    join_folded, origin_to_part, other_spellings, push_charged, push_target_records, under_bytes,
+    under_str,
 };
 
 fn finish_recursive_exhausted(
@@ -2134,8 +2134,8 @@ fn walk_followed_links(
     Ok(())
 }
 
-/// The records of a followed link's target: [`check_target_into`] (written and
-/// canonical names, identities, gaps), `dev`'s alias rule ([`push_alias_records`])
+/// The records of a followed link's target: [`push_target_records`] (written and
+/// canonical names, identities, gaps, and `dev`'s alias rule)
 /// and `dev`'s `links_below` rule: a link whose real path is in, is, or holds
 /// a canonical protected root reaches it. Each record is appended to `out` as
 /// soon as it is established.
@@ -2150,8 +2150,9 @@ fn followed_link_records(
     aliases: &mut RootAliases,
     out: &mut Vec<PartResult>,
 ) -> Result<(), Exhausted> {
-    check_target_into(target, protected, budget, out, false)?;
-    push_alias_records(target, protected, resolver, caps, budget, aliases, out)?;
+    push_target_records(
+        target, protected, resolver, caps, budget, aliases, out, false,
+    )?;
     if let TargetResolution::Resolved { canonical, .. } = &target.resolution {
         // When the type cannot be read, "not a folder" is the stricter
         // answer: the root's own path then counts as reached.
