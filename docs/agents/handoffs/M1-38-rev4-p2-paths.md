@@ -1010,3 +1010,87 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p atrium-core --lib policy::v4::paths
 cargo test --workspace --no-fail-fast
 ```
+
+---
+
+## Round 15
+
+Input: review 12 (Claude Sonnet 5.5, `.orchestration/review-input/M1-38-rev4-p2-paths-round12.md`) on round 14 (two Low findings and five test-gap groups), driver decision D-173. Zero P3 files, zero `Cargo.toml` changes, and zero frozen P0 interface files (`model.rs`, `limits.rs`, `tools.rs`, `paths.rs` signatures) were touched.
+
+Commits on `agent/neon/M1-38-rev4-p2-paths`:
+- `deb88d34`: non-Linux Unix transient stream peak check (`DIR_STREAM_PEAK_FLOOR` / `DIR_STREAM_MAX_BLKSIZE` / `charge_dir_stream` / `charge_alloc_with_headroom`), flat `DIR_STREAM_ALLOC` permanent deduction, pre-`next()` `NAME_COMPUTE_PEAK` and pre-copy name compute charge, `DT_UNKNOWN` `ENOENT` -> `Io(Other)` mapping, and updated per-platform doc comments (`paths/resolver.rs`).
+- `24f47657`: updated round 13 & round 14 `read_dir` tests and added all five round 15 test suites covering stream-charge/blksize injection/100-dir walk/call-level worst case, pre-`next()` alloc & compute peak checks + fd-leak checks, literal constants, `DT_UNKNOWN`, and `attach_applicable_gap` edge cases (`paths/p2_tests.rs`).
+- handoff commit: this section (`docs/agents/handoffs/M1-38-rev4-p2-paths.md`).
+
+### Finding 1 (Low): Non-Linux Unix `read_dir` stream charge scaled permanently with `st_blksize` (§2, §8)
+
+- **Cause:**
+  1. In `crates/atrium-core/src/policy/v4/paths/resolver.rs`, round 14 permanently deducted `dir_stream_alloc_for_blksize(st_blksize)` (e.g., 131,328 bytes on a 128 KiB exFAT/SMB/NFS volume or 1 MiB + 256 on a 1 MiB volume) from the call-wide 8 MiB `COMPUTE_BUDGET_ALLOC_BYTES` on every directory listing, even though libc frees `dd_buf` when the `Dir` stream closes. On a 128 KiB volume, walking ~70 directories exhausted `AllocationBudget` on the 64th listing (turning `Clear` or `Unread(DirOpens)` into `Exhausted`, which asks even under FullAccess, violating §2).
+  2. The 4,096-byte floor assumed Darwin's `fdopendir` allocated at most 4 KiB on a 4 KiB volume, leaving a risk of under-charging if Darwin uses a page-size (16 KiB on Apple Silicon) or larger minimum buffer.
+  3. An absurdly large positive `st_blksize` was saturated into `charge_alloc` instead of rejected as `Io(Other)`.
+- **Fix (`deb88d34`, `paths/resolver.rs`):**
+  - Treated libc's `dd_buf` like the other transient buffers (`FALLBACK_CANON_PEAK`, `NAME_ALLOC_PEAK`):
+    - Added `DIR_STREAM_PEAK_FLOOR = 65_536` (64 KiB, covering 4 KiB APFS/HFS+, 16 KiB Apple Silicon `PAGE_SIZE`, 32–64 KiB minimum buffer sizes / 64 KiB page systems, and far exceeding `sizeof(struct dirent)` ~1,048 B on 64-bit Darwin) and `DIR_STREAM_MAX_BLKSIZE = 1_048_576` (1 MiB, matching Darwin `MAXBSIZE` and realistic large exFAT/SMB/NFS/ZFS block sizes).
+    - Replaced `dir_stream_alloc_for_blksize` with `dir_stream_peak_for_blksize(blksize)` (`blksize.max(DIR_STREAM_PEAK_FLOOR).saturating_add(DIR_STREAM_OVERHEAD)`) and `charge_dir_stream(raw_blksize: impl TryInto<usize>, budget)`.
+    - `charge_dir_stream` rejects negative or absurd (`> DIR_STREAM_MAX_BLKSIZE`) `st_blksize` values as `ResolveError::Io(FsIoError::Other)` (`Unread`) before touching `budget` or calling `Dir::new`; checks without permanently deducting that `budget.remaining_alloc_bytes() >= peak` (exhausting `AllocationBudget` before `Dir::new` if not); permanently deducts **only** `DIR_STREAM_ALLOC` (`4_352` bytes), so call totals match Linux on every volume; and returns the live transient headroom `stream_extra = peak - DIR_STREAM_ALLOC`.
+    - While the `Dir` stream remains open, `stream_extra` is preserved as live headroom across both per-entry `dir.next()` checks (`stream_extra + NAME_ALLOC_PEAK`) and retained allocations inside `push_unix_dir_entry` / `push_entry_charged` / `stat_dir_child_by_path` (`charge_alloc_with_headroom`), so simultaneous live heap never exceeds the budget while permanent deductions remain identical to Linux.
+  - Updated `DIR_STREAM_ALLOC` and all new constant/function doc comments so every per-platform statement accurately describes only what runs on that platform (Linux, non-Linux Unix, non-Unix).
+  - Added `#[cfg(all(test, unix, not(target_os = "linux")))] read_dir_unix_with_blksize_override` (backed by shared `read_dir_unix_impl`) so tests can inject synthetic `st_blksize` values (128 KiB, 1 MiB, negative, absurd) through the real `open` + `charge_dir_stream` + `Dir::new` path.
+
+### Finding 2 (Low): Non-Linux Unix `read_dir` copied entry names before charging their compute (§8)
+
+- **Cause:** On non-Linux Unix (`resolver.rs:557-575`), before `dir.next()` only `budget.charge(1)` had run, while both `rustix::fs::Dir::read`'s `CString` copy (up to `MAX_D_NAME_BUF` bytes) and `name_buf[..len].copy_from_slice(raw_with_nul)` ran before `push_unix_dir_entry` charged `name_bytes.len() - 1`. With 1 compute unit left and a 255-byte name, both copies executed before `ComputeBudget` exhausted.
+- **Fix (`deb88d34`, `paths/resolver.rs`):**
+  - Exported `MAX_D_NAME_BUF` (`1_024` on macOS/iOS, `256` on other non-Linux Unix) and defined `NAME_COMPUTE_PEAK = MAX_D_NAME_BUF as u64`.
+  - Before every `dir.next()` (next to the `iter_alloc_peak` check and before `on_iter()`), added `if budget.remaining_units() < NAME_COMPUTE_PEAK { budget.charge(NAME_COMPUTE_PEAK)?; }`, preventing `Dir::read` from copying any `d_name` past the remaining compute budget.
+  - After `dir.next()`, skipped `.` and `..` before any stack copy, charged `budget.charge(name_bytes.len().saturating_sub(1) as u64)?` **before** `name_buf[..len].copy_from_slice(raw_with_nul)`, and passed `name_compute_precharged = true` into `push_unix_dir_entry` (Linux passes `false`) so name compute is never double-charged and per-entry totals remain identical to Linux.
+
+### `DT_UNKNOWN` `ENOENT` handling (`deb88d34`, `paths/resolver.rs`)
+
+- **Cause:** Review 12 noted that on a `DT_UNKNOWN` entry returned from an already-open directory, an `ENOENT` from `fstatat` (entry vanished or parent renamed concurrently) mapped via `map_errno` to `ResolveError::NotFound`, which callers treat as the entire directory being absent.
+- **Fix:** Added `map_dt_unknown_stat_errno` (used by both Linux `DirStatBase::Fd` and non-Linux Unix `DirStatBase::Path` in `push_unix_dir_entry` / `stat_dir_child_by_path`) mapping `Errno::NOENT` to `ResolveError::Io(FsIoError::Other)` (`Unread`), never silently discarding the listing as `NotFound`.
+
+### Tests updated and added (`24f47657`, `paths/p2_tests.rs`)
+
+All expectations were derived from contract §1, §2, §5, §8 and D-144/D-145, and verified by hand across Linux and macOS code paths (D-123: no test suite run by worker):
+
+| Review 12 / Round 15 item | Test (`p2_tests.rs`) | Coverage |
+|---|---|---|
+| Round 13/14 baseline updates | `round13_read_dir_charges_dir_stream_alloc_and_single_dir_open`, `round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity` (`#[cfg(unix)]`) | Replaced tautological `expected_dir_stream_alloc` with literal `4_352` (`DIR_STREAM_ALLOC`) assertions and `expected_dir_peak_headroom` (`0` on Linux, `stream_extra + NAME_ALLOC_PEAK` on non-Linux Unix); verifies exact cross-platform total-deduction parity. |
+| Literal constants + `charge_dir_stream` unit bounds | `round15_read_dir_literal_constants_and_stream_charge_bounds` (all platforms; non-Linux Unix sub-block) | Asserts literal `DIR_STREAM_OVERHEAD == 256`, `DIR_STREAM_ALLOC == 4_352`, `DIR_STREAM_PEAK_FLOOR == 65_536`, `DIR_STREAM_MAX_BLKSIZE == 1_048_576`, `MAX_D_NAME_BUF == 1_024` (`256` non-Apple), `NAME_ALLOC_PEAK == 1_088` (`320` non-Apple), `NAME_COMPUTE_PEAK == 1_024` (`256` non-Apple), `NAME_ALLOC_PEAK > MAX_D_NAME_BUF`; pins `dir_stream_peak_for_blksize` (0..=1 MiB) and `charge_dir_stream` for 128 KiB (deducts only 4,352; `peak - 1` Exhausted), 4 KiB (64 KiB floor enforced), 1 MiB, negative (`-1i64`, `-4096`, `i64::MIN`, `-1i32`), and absurd (`1_048_577`, 16 MiB, `i64::MAX`, `usize::MAX`) -> `Io(Other)` without touching budget. |
+| 100-dir large-blksize walk + call-level worst case | `round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case` (`#[cfg(unix)]`) | Real-FS 100-subdirectory tree (`rg -L` `LinkPolicy { at_root: true, below_root: true }`) wrapped with injected 128 KiB and 1 MiB `st_blksize` ends `Clear` (and `Unread(WalkCapReached(DirOpens))` when `dir_opens = 50`), never `Exhausted`; pins `read_dir_unix_with_blksize_override(131_072)` enforcing 131,328 peak while deducting 4,352; plus call-level worst case combining 4,096 single-component operands (with macOS `FALLBACK_CANON_OVERHEAD`) and 1,024 real `DirOpens` at 128 KiB blksize on one default `FsCaps` and `ComputeBudget`, ending at `Unread(WalkCapReached(DirOpens))`, never `Exhausted`. |
+| Pre-`next()` peak checks (`on_iter == 0`) + fd count == 0 on early failure | `round15_read_dir_peak_checks_precede_next_and_prevent_fd_leaks` (`#[cfg(unix)]`) | Uses `read_dir_unix_with_hooks` and `read_dir_unix_with_blksize_override` over a 255-byte-name tempdir: asserts `on_iter == 0` when alloc budget is below stream peak or below `stream_extra + NAME_ALLOC_PEAK`, and when compute budget is at 1 unit left (`path_units + 2`) or `NAME_COMPUTE_PEAK - 1`; asserts open fd count is 1 inside `after_open` and 0 after stream-charge Exhausted (local & 128 KiB), peak-check Exhausted (alloc & compute), and negative/absurd `st_blksize` (`-1`, `-4_096`, `1_048_577`, `i64::MAX`); asserts exact compute total (`+254` once, not double-charged) and exact minimum compute budget (`deducted + NAME_COMPUTE_PEAK`). |
+| `DT_UNKNOWN` branch (`DirStatBase::{Fd, Path}`, `stat_dir_child_by_path`) | `round15_dt_unknown_push_unix_dir_entry_types_enoent_heap_and_charge_order` (`#[cfg(unix)]`) | Feeds `rustix::fs::FileType::Unknown` directly into `push_unix_dir_entry` over a real tempdir: classifies file, dir, symlink, dangling symlink (`SYMLINK_NOFOLLOW`), and FIFO (`mkfifo` -> `FileType::Other`), skips `.`/`..` with 0 stats, verifies exact 5-stat consumption, pins `ENOENT` -> `Io(Other)` (never `NotFound`, `out` intact), proves stat cap and compute precede `fstatat` on both existing and vanished entries, and on non-Linux Unix exercises trailing-slash (`sep == 0`) and `dir + name >= PATH_MAX` heap branch (stat cap, compute, `alloc_len`, and `alloc_headroom` charged before `statat`). |
+| `attach_applicable_gap` edge cases | `round15_attach_applicable_gap_edge_cases` (all platforms) | Using folded `.AWS/credentials` so `AnyTarget` gap `R1` is strictly independent of `RootAliases`: (1) variant-only glob match with both `R1` and incomplete alias table `R2` gets neither reason (both direct `push_target_records` and end-to-end `cat proj/*`); (2) NFD `cafe\u{0301}` (`UnlistedNameEquivalence`) plus `R1` keeps both (and keeps all three with `R2`); (3) write-only gap (`ATRIUM_CFG`) is not attached on `Read` and is attached on `Write` / `ReadWrite`; (4) compute exhaustion inside `push_alias_records` loses only the gap Unread and keeps the call `Exhausted` (preserving `StoreHit` on `.pypirc` and `Clear` on `proj/readme`, in direct `push_target_records`, `resolve_subject_paths`, and `resolve_command_targets`). |
+
+### Cross-platform `#[cfg]` audit (macOS/iOS, other non-Linux Unix, Linux, non-Unix)
+
+- `paths/resolver.rs`:
+  - `PATH_MAX` (`pub(super)`): partitioned cleanly into `any(target_os = "macos", target_os = "ios")` (`1024`) and `not(any(target_os = "macos", target_os = "ios"))` (`4096`); used across all targets.
+  - `DIR_STREAM_OVERHEAD`, `DIR_STREAM_ALLOC`, `charge_alloc_with_headroom`, `push_entry_charged`: unconditional; used across Linux, non-Linux Unix, and non-Unix.
+  - `DIR_STREAM_PEAK_FLOOR`, `DIR_STREAM_MAX_BLKSIZE`, `NAME_ALLOC_PEAK`, `NAME_COMPUTE_PEAK`, `dir_stream_peak_for_blksize`, `charge_dir_stream`, `stat_dir_child_by_path`: `#[cfg(all(unix, not(target_os = "linux")))]`; all used in non-test `read_dir_unix_impl` and `push_unix_dir_entry` (zero dead code in non-test builds).
+  - `MAX_D_NAME_BUF` (`pub(super)`): partitioned into `any(target_os = "macos", target_os = "ios")` (`1_024`) and `all(unix, not(any(target_os = "linux", target_os = "macos", target_os = "ios")))` (`256`), exact union `all(unix, not(target_os = "linux"))`.
+  - `read_dir_unix_with_blksize_override`: `#[cfg(all(test, unix, not(target_os = "linux")))]`; test-only hook (zero dead code in `--lib` builds).
+  - `DirStatBase`, `map_dt_unknown_stat_errno`, `push_unix_dir_entry`, `read_dir_unix_with_hooks`, `read_dir_unix_impl`: `#[cfg(unix)]`. On Linux, `blksize_override` is bound with `let _ = blksize_override;`, `use std::os::fd::AsFd;` is scoped inside the Linux block, and `push_unix_dir_entry` passes `false, 0`. On non-Linux Unix, `charge_dir_stream` accepts `impl TryInto<usize>` so `st.st_blksize` needs zero integer casts or `clippy::useless_conversion` allows across 32/64-bit signed/unsigned Unix targets. On `#[cfg(not(unix))]`, `FsResolver::read_dir` passes `0` headroom to `push_entry_charged`.
+- `paths/p2_tests.rs`:
+  - `expected_dir_peak_headroom(dir)`: `#[cfg(unix)]`, binds `let _ = dir;` on Linux.
+  - `round15_read_dir_literal_constants_and_stream_charge_bounds`: unconditional; non-Linux Unix block uses `const { assert!(...); }` for constant inequalities (matching `limits.rs`, avoiding `clippy::assertions_on_constants`) and partitions Apple vs other non-Linux Unix cleanly.
+  - `round15_read_dir_large_blksize_100_dir_walk_and_call_level_worst_case`: `#[cfg(unix)]`; `LargeBlksizeFsResolver::read_dir` binds `let _ = self.blksize;` on Linux; `WorstCaseResolver` scopes platform imports inside each `#[cfg]` arm.
+  - `round15_read_dir_peak_checks_precede_next_and_prevent_fd_leaks`: `#[cfg(unix)]`; imports only used symbols in both Linux and non-Linux Unix arms; uses `long_name` in both arms.
+  - `round15_dt_unknown_push_unix_dir_entry_types_enoent_heap_and_charge_order`: `#[cfg(unix)]`; scopes `OsStrExt` inside `#[cfg(not(target_os = "linux"))]` and `rustix::fs::open` + `AsFd` inside `#[cfg(target_os = "linux")]`, with `PATH_MAX` inside `#[cfg(all(unix, not(target_os = "linux")))]`.
+  - `round15_attach_applicable_gap_edge_cases`: unconditional (`FakeFs`), compiles and runs on all platforms.
+
+### Verification
+
+Run by the worker (D-123):
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core --tests` — clean on macOS (0 errors, 0 warnings)
+- No tests or `clippy` were run (D-123).
+
+Commands for the orchestrator's verification (fish-compatible; run on both macOS and Linux):
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core --lib policy::v4::paths
+cargo test --workspace --no-fail-fast
+```
