@@ -156,21 +156,101 @@ impl Redirect {
 /// backgrounding, here-docs, subshells and compound commands.
 pub fn parse_command(line: &str, cwd: &std::path::Path) -> ParsedCommand {
     let _ = cwd;
-    let lexed = shell::lex(line);
-    if !lexed.reasons.is_empty() {
+    if line.len() > limits::MAX_BYTES {
         return ParsedCommand::Unparseable {
-            reason: lexed.reasons.join(", "),
+            reason: "too large".into(),
         };
     }
-    // Top-level commands only: payloads are the hard-deny list's business.
-    ParsedCommand::Segments(
-        lexed
-            .units
-            .into_iter()
-            .filter(|u| !u.derived)
-            .map(|u| u.seg)
-            .collect(),
-    )
+    let mut budget = model::ComputeBudget::with_default_limits();
+    let lexed = match v4::lex::lex_exact(line, 0, None, &mut budget) {
+        Ok(l) => l,
+        Err(outcome) => {
+            return ParsedCommand::Unparseable {
+                reason: format!("{outcome:?}"),
+            };
+        }
+    };
+    if let Some(first) = lexed.outcomes.first() {
+        return ParsedCommand::Unparseable {
+            reason: format!("{:?}", first.outcome),
+        };
+    }
+    let mut segments = Vec::with_capacity(lexed.units.len());
+    for u in lexed.units {
+        if u.argv.iter().any(model::Word::has_unquoted_glob) {
+            return ParsedCommand::Unparseable {
+                reason: "glob".into(),
+            };
+        }
+        let mut argv = Vec::with_capacity(u.argv.len());
+        for w in &u.argv {
+            match std::str::from_utf8(w.literal_bytes()) {
+                Ok(s) => argv.push(s.to_owned()),
+                Err(_) => {
+                    return ParsedCommand::Unparseable {
+                        reason: "non-utf8".into(),
+                    };
+                }
+            }
+        }
+        let mut redirects = Vec::with_capacity(u.redirects.len());
+        for r in &u.redirects {
+            let (fd, op, target) = match r {
+                model::ModelRedirect::Read { target } => {
+                    let Ok(s) = std::str::from_utf8(target.literal_bytes()) else {
+                        return ParsedCommand::Unparseable {
+                            reason: "non-utf8".into(),
+                        };
+                    };
+                    (0u32, RedirectOp::Read, s.to_owned())
+                }
+                model::ModelRedirect::Write { target } => {
+                    let Ok(s) = std::str::from_utf8(target.literal_bytes()) else {
+                        return ParsedCommand::Unparseable {
+                            reason: "non-utf8".into(),
+                        };
+                    };
+                    (1u32, RedirectOp::Write, s.to_owned())
+                }
+                model::ModelRedirect::Append { target } => {
+                    let Ok(s) = std::str::from_utf8(target.literal_bytes()) else {
+                        return ParsedCommand::Unparseable {
+                            reason: "non-utf8".into(),
+                        };
+                    };
+                    (1u32, RedirectOp::Append, s.to_owned())
+                }
+                model::ModelRedirect::ErrWrite { target } => {
+                    let Ok(s) = std::str::from_utf8(target.literal_bytes()) else {
+                        return ParsedCommand::Unparseable {
+                            reason: "non-utf8".into(),
+                        };
+                    };
+                    (2u32, RedirectOp::Write, s.to_owned())
+                }
+                model::ModelRedirect::ErrAppend { target } => {
+                    let Ok(s) = std::str::from_utf8(target.literal_bytes()) else {
+                        return ParsedCommand::Unparseable {
+                            reason: "non-utf8".into(),
+                        };
+                    };
+                    (2u32, RedirectOp::Append, s.to_owned())
+                }
+                model::ModelRedirect::Dup { from, to } => {
+                    (*from as u32, RedirectOp::Dup, (*to as u8).to_string())
+                }
+                model::ModelRedirect::Close { fd } => (*fd as u32, RedirectOp::Dup, "-".to_owned()),
+            };
+            redirects.push(Redirect { fd, op, target });
+        }
+        segments.push(Segment {
+            assignments: Vec::new(),
+            argv,
+            redirects,
+            piped: u.separator_before == model::Separator::Pipe,
+        });
+    }
+    ParsedCommand::Segments(segments)
 }
 
 /// The default [`PolicyEngine`]: hard-deny defaults, rules, presets.

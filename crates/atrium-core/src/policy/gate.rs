@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use atrium_agents::{ApprovalTicket, BoxFuture, GateDecision, ToolCheck, ToolGate};
-use atrium_protocol::agent::{Provider, ToolKind};
+use atrium_protocol::agent::{Provider, UnreadNotice};
 use atrium_protocol::policy::{
     HARD_DENY_DEFAULTS, PolicyContext, Preset, Rule, RuleMatcher, RuleOrigin, ToolSubject,
 };
@@ -15,7 +15,10 @@ use atrium_protocol::thread::ThreadId;
 
 use super::deny;
 use super::engine;
+use super::limits;
+use super::model::{ComputeBudget, FoldRules, FsCaps};
 use super::shell;
+use super::v4;
 use super::words::{self, expand_home, normalize};
 use super::{SessionGate, input_sha256};
 use crate::{ApprovalLedger, Binding, PolicyEngine, PolicyInput, PolicyVerdict, RequestKey, Store};
@@ -112,6 +115,7 @@ fn resolve_fs(p: &Path, hops: u8) -> PathBuf {
 }
 
 /// Escapes glob metacharacters so the pattern matches only `p`.
+#[allow(dead_code)]
 fn escape_glob(p: &Path) -> String {
     let mut s = String::new();
     for c in p.to_string_lossy().chars() {
@@ -249,7 +253,115 @@ fn ssh_members(home: &Path) -> SshTree {
     out
 }
 
+#[cfg(unix)]
+fn path_to_bytes(p: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_to_bytes(p: &Path) -> Vec<u8> {
+    p.as_os_str().as_encoded_bytes().to_vec()
+}
+
+fn precheck_too_large(check: &ToolCheck) -> bool {
+    match &check.subject {
+        ToolSubject::Command { line, .. } => line.len() > limits::MAX_BYTES,
+        ToolSubject::Paths { paths, glob, .. } => {
+            paths.len() > limits::MAX_USES
+                || glob.as_deref().is_some_and(|g| g.len() > limits::MAX_BYTES)
+        }
+        ToolSubject::Fetch { url } => url.len() > limits::MAX_BYTES,
+        ToolSubject::Mcp { .. } | ToolSubject::None | ToolSubject::Unknown => false,
+    }
+}
+
 fn evaluate_sync(
+    c: &SessionGateConfig,
+    _policy: &dyn PolicyEngine,
+    check: &ToolCheck,
+    rules: &[Rule],
+    preset: Preset,
+) -> Result<Evaluated, String> {
+    if precheck_too_large(check) {
+        return Ok(Evaluated {
+            verdict: PolicyVerdict::Deny {
+                reason: "too large to check".into(),
+                rule: None,
+            },
+            remember_matcher: None,
+            unread: None,
+        });
+    }
+
+    let input = PolicyInput {
+        check,
+        thread: &c.thread,
+        provider: c.provider,
+        cwd: &c.cwd,
+        home: &c.home,
+        atrium_data_paths: &c.atrium_data_paths,
+        atrium_protected_paths: &c.atrium_protected_paths,
+        resolved_paths: &[],
+        preset,
+    };
+
+    let resolver = v4::paths::FsResolver::new();
+    let mut budget = ComputeBudget::with_default_limits();
+    // Give `build_protected_set` its own `FsCaps` so its protected-root scans
+    // do not consume the call's filesystem caps (contract §8).
+    let mut protected_caps = FsCaps::with_default_limits();
+    let home_bytes = path_to_bytes(&c.home);
+    let cwd_bytes = path_to_bytes(&c.cwd);
+    let data_bytes: Vec<Vec<u8>> = c
+        .atrium_data_paths
+        .iter()
+        .map(|p| path_to_bytes(p))
+        .collect();
+    let prot_bytes: Vec<Vec<u8>> = c
+        .atrium_protected_paths
+        .iter()
+        .map(|p| path_to_bytes(p))
+        .collect();
+
+    let protected = match v4::paths::sensitive::build_protected_set(
+        &home_bytes,
+        &cwd_bytes,
+        data_bytes,
+        prot_bytes,
+        FoldRules::REV4,
+        &resolver,
+        &mut protected_caps,
+        &mut budget,
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok(Evaluated {
+                verdict: PolicyVerdict::Ask,
+                remember_matcher: None,
+                unread: Some(UnreadNotice::Exhausted),
+            });
+        }
+    };
+
+    let eval =
+        v4::evaluate::evaluate_call_with_budget(&input, rules, &protected, &resolver, &mut budget);
+    let unread = v4::evaluate::unread_notice_for_outcome(&eval.outcome);
+    let remember_matcher = if unread.is_some() {
+        None
+    } else {
+        eval.remember_matcher
+    };
+
+    Ok(Evaluated {
+        verdict: eval.verdict,
+        remember_matcher,
+        unread,
+    })
+}
+
+#[allow(dead_code)]
+fn _legacy_evaluate_sync(
     c: &SessionGateConfig,
     policy: &dyn PolicyEngine,
     check: &ToolCheck,
@@ -365,7 +477,12 @@ fn evaluate_sync(
     {
         verdict = PolicyVerdict::Ask;
     }
-    Ok(Evaluated { verdict, resolved })
+    let _ = resolved;
+    Ok(Evaluated {
+        verdict,
+        remember_matcher: None,
+        unread: None,
+    })
 }
 
 /// Commands that read every file below a folder they are given. `grep`'s
@@ -1542,7 +1659,8 @@ fn tree_has_multiply_linked(root: &Path, max_depth: u8) -> bool {
 
 pub struct Evaluated {
     pub verdict: PolicyVerdict,
-    pub resolved: Vec<PathBuf>,
+    pub remember_matcher: Option<RuleMatcher>,
+    pub unread: Option<UnreadNotice>,
 }
 
 impl SessionGate {
@@ -1597,43 +1715,11 @@ impl SessionGate {
         .map_err(|e| format!("internal error while checking: {e}"))?
     }
 
-    /// The rule "always…" would create (contract §5, `SessionGate` docs).
-    fn remember_matcher(&self, check: &ToolCheck, e: &Evaluated) -> Option<RuleMatcher> {
-        match &check.subject {
-            ToolSubject::Command { line, .. } => {
-                let l = shell::lex(line);
-                if !l.reasons.is_empty() || l.units.len() != 1 {
-                    return None;
-                }
-                let u = &l.units[0];
-                if !u.seg.assignments.is_empty()
-                    || u.seg.argv.is_empty()
-                    || !u.seg.redirects.iter().all(super::Redirect::harmless)
-                {
-                    return None;
-                }
-                Some(RuleMatcher::CommandExact {
-                    argv: u.seg.argv.clone(),
-                })
-            }
-            ToolSubject::Paths { paths, .. } => {
-                let file_tool = matches!(
-                    check.kind,
-                    ToolKind::Read
-                        | ToolKind::Edit
-                        | ToolKind::Delete
-                        | ToolKind::Move
-                        | ToolKind::Search
-                );
-                if !file_tool || paths.len() != 1 || e.resolved.len() != 1 {
-                    return None;
-                }
-                Some(RuleMatcher::PathGlob {
-                    glob: escape_glob(&e.resolved[0]),
-                })
-            }
-            _ => None,
-        }
+    /// The rule "always…" would create (superseded by rev 4 `v4::rules::remember_matcher`,
+    /// removed in the deletion commit).
+    #[allow(dead_code)]
+    fn remember_matcher(&self, _check: &ToolCheck, e: &Evaluated) -> Option<RuleMatcher> {
+        e.remember_matcher.clone()
     }
 
     async fn do_check(&self, check: &ToolCheck) -> Result<GateDecision, String> {
@@ -1660,8 +1746,8 @@ impl SessionGate {
                     input_sha256: input_sha256(check),
                     context,
                     title: check.title.clone(),
-                    remember_matcher: self.remember_matcher(check, &e),
-                    unread: None,
+                    remember_matcher: e.remember_matcher,
+                    unread: e.unread,
                 };
                 let ticket = self
                     .ledger

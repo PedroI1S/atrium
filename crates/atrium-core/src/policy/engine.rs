@@ -904,74 +904,172 @@ impl Home<'_> {
     }
 }
 
+/// Pure, non-filesystem [`super::v4::paths::PathResolver`] used by
+/// [`DefaultPolicy::evaluate`] (contract §5: the engine itself never touches
+/// the filesystem; [`super::SessionGate`] does).
+struct VirtualResolver;
+
+impl super::v4::paths::PathResolver for VirtualResolver {
+    fn stat(
+        &self,
+        _path: &[u8],
+        caps: &mut super::model::FsCaps,
+        budget: &mut super::model::ComputeBudget,
+    ) -> Result<super::model::PathMetadata, super::model::ResolveError> {
+        caps.charge_stat()?;
+        budget.charge(1)?;
+        Err(super::model::ResolveError::NotFound)
+    }
+
+    fn lstat(
+        &self,
+        _path: &[u8],
+        caps: &mut super::model::FsCaps,
+        budget: &mut super::model::ComputeBudget,
+    ) -> Result<super::model::PathMetadata, super::model::ResolveError> {
+        caps.charge_stat()?;
+        budget.charge(1)?;
+        Err(super::model::ResolveError::NotFound)
+    }
+
+    fn read_link(
+        &self,
+        _path: &[u8],
+        caps: &mut super::model::FsCaps,
+        budget: &mut super::model::ComputeBudget,
+    ) -> Result<Vec<u8>, super::model::ResolveError> {
+        caps.charge_link_read()?;
+        budget.charge(1)?;
+        Err(super::model::ResolveError::NotFound)
+    }
+
+    fn canonicalize(
+        &self,
+        _path: &[u8],
+        caps: &mut super::model::FsCaps,
+        budget: &mut super::model::ComputeBudget,
+    ) -> Result<Vec<u8>, super::model::ResolveError> {
+        caps.charge_canonicalize()?;
+        budget.charge(1)?;
+        Err(super::model::ResolveError::NotFound)
+    }
+
+    fn read_dir(
+        &self,
+        _path: &[u8],
+        caps: &mut super::model::FsCaps,
+        budget: &mut super::model::ComputeBudget,
+    ) -> Result<Vec<super::model::DirEntry>, super::model::ResolveError> {
+        caps.charge_dir_open()?;
+        budget.charge(1)?;
+        Err(super::model::ResolveError::NotFound)
+    }
+}
+
+#[cfg(unix)]
+fn engine_path_bytes(p: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn engine_path_bytes(p: &Path) -> Vec<u8> {
+    p.as_os_str().as_encoded_bytes().to_vec()
+}
+
 impl PolicyEngine for DefaultPolicy {
     fn evaluate(&self, input: &PolicyInput<'_>, rules: &[Rule]) -> PolicyVerdict {
-        let a = deny::analyze(input);
-        if a.overflow {
-            return PolicyVerdict::Deny {
-                reason: "too large to check".into(),
-                rule: None,
+        let protected = super::model::ProtectedSet {
+            home: engine_path_bytes(input.home),
+            cwd: engine_path_bytes(input.cwd),
+            atrium_data_paths: input
+                .atrium_data_paths
+                .iter()
+                .map(|p| engine_path_bytes(p))
+                .collect(),
+            atrium_protected_paths: input
+                .atrium_protected_paths
+                .iter()
+                .map(|p| engine_path_bytes(p))
+                .collect(),
+            hard_deny_identities: Vec::new(),
+            write_only_hard_deny_identities: Vec::new(),
+            identity_gaps: Vec::new(),
+            store_identities: Vec::new(),
+            ssh_linked_dirs: Vec::new(),
+            folds: super::model::FoldRules::REV4,
+        };
+        super::v4::evaluate::evaluate_call(input, rules, &protected, &VirtualResolver).verdict
+    }
+}
+
+#[allow(dead_code)]
+fn _legacy_default_policy_evaluate(input: &PolicyInput<'_>, rules: &[Rule]) -> PolicyVerdict {
+    let a = deny::analyze(input);
+    if a.overflow {
+        return PolicyVerdict::Deny {
+            reason: "too large to check".into(),
+            rule: None,
+        };
+    }
+    if let Some(id) = deny::hard_deny(input, &a) {
+        return PolicyVerdict::HardDeny { id };
+    }
+    let esc = a.glob_escape.as_ref();
+    let glob_leaves = esc.is_some_and(deny::GlobEscape::leaves);
+    let glob_unbounded =
+        esc.is_some_and(|e| e.unbounded) || a.glob_search.as_ref().is_some_and(|(_, u)| *u);
+    let out = apply_rules(input, &a, rules, glob_leaves);
+    if let Some((reason, rule)) = out.deny {
+        return PolicyVerdict::Deny {
+            reason: reason.unwrap_or_default(),
+            rule,
+        };
+    }
+    // A search glob that can name files outside every path the subject
+    // gives (M1-18, P1; D-100): hard-denied (above) if an expansion hits
+    // the hard-deny list, otherwise allowed by FullAccess or an Any rule
+    // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
+    // When glob expansion overflows (brace or variant cap), Ask everywhere.
+    let unknown = matches!(input.check.subject, ToolSubject::Unknown)
+        || a.unbounded_unknown_dangerous
+        || glob_unbounded;
+    let command = matches!(input.check.subject, ToolSubject::Command { .. });
+    if !unknown
+        && (!glob_leaves || out.any_allow)
+        && out.covered.iter().all(|c| *c)
+        && (command && !parts(&a).is_empty() || !command)
+    {
+        return PolicyVerdict::Allow {
+            rule: out.allow_rule,
+        };
+    }
+    if unknown {
+        return PolicyVerdict::Ask;
+    }
+    if glob_leaves {
+        return if input.preset == Preset::FullAccess {
+            PolicyVerdict::Allow { rule: None }
+        } else {
+            PolicyVerdict::Ask
+        };
+    }
+    match input.preset {
+        Preset::Home | Preset::Normal | Preset::Trusted => {
+            let h = Home {
+                input,
+                a: &a,
+                s: deny::sensitive(input),
             };
+            h.evaluate(&out.covered, out.allow_rule)
         }
-        if let Some(id) = deny::hard_deny(input, &a) {
-            return PolicyVerdict::HardDeny { id };
-        }
-        let esc = a.glob_escape.as_ref();
-        let glob_leaves = esc.is_some_and(deny::GlobEscape::leaves);
-        let glob_unbounded =
-            esc.is_some_and(|e| e.unbounded) || a.glob_search.as_ref().is_some_and(|(_, u)| *u);
-        let out = apply_rules(input, &a, rules, glob_leaves);
-        if let Some((reason, rule)) = out.deny {
-            return PolicyVerdict::Deny {
-                reason: reason.unwrap_or_default(),
-                rule,
-            };
-        }
-        // A search glob that can name files outside every path the subject
-        // gives (M1-18, P1; D-100): hard-denied (above) if an expansion hits
-        // the hard-deny list, otherwise allowed by FullAccess or an Any rule
-        // and asked in Home/Normal/Trusted/Careful and under prefix/scoped rules.
-        // When glob expansion overflows (brace or variant cap), Ask everywhere.
-        let unknown = matches!(input.check.subject, ToolSubject::Unknown)
-            || a.unbounded_unknown_dangerous
-            || glob_unbounded;
-        let command = matches!(input.check.subject, ToolSubject::Command { .. });
-        if !unknown
-            && (!glob_leaves || out.any_allow)
-            && out.covered.iter().all(|c| *c)
-            && (command && !parts(&a).is_empty() || !command)
-        {
-            return PolicyVerdict::Allow {
-                rule: out.allow_rule,
-            };
-        }
-        if unknown {
-            return PolicyVerdict::Ask;
-        }
-        if glob_leaves {
-            return if input.preset == Preset::FullAccess {
+        Preset::Careful => {
+            if matches!(input.check.subject, ToolSubject::None) {
                 PolicyVerdict::Allow { rule: None }
             } else {
                 PolicyVerdict::Ask
-            };
-        }
-        match input.preset {
-            Preset::Home | Preset::Normal | Preset::Trusted => {
-                let h = Home {
-                    input,
-                    a: &a,
-                    s: deny::sensitive(input),
-                };
-                h.evaluate(&out.covered, out.allow_rule)
             }
-            Preset::Careful => {
-                if matches!(input.check.subject, ToolSubject::None) {
-                    PolicyVerdict::Allow { rule: None }
-                } else {
-                    PolicyVerdict::Ask
-                }
-            }
-            Preset::FullAccess => PolicyVerdict::Allow { rule: None },
         }
+        Preset::FullAccess => PolicyVerdict::Allow { rule: None },
     }
 }
