@@ -234,3 +234,75 @@ Rework addressing both medium findings from `.orchestration/review-input/review-
 - `cargo check -p atrium-core -p atrium-daemon -p atrium-protocol --tests` — clean (0 errors, 0 warnings)
 - `cargo clippy -p atrium-core -p atrium-daemon -p atrium-protocol --tests -- -D warnings` — clean (0 errors, 0 warnings)
 - No `cargo test` or `pnpm` run by worker; orchestrator verification runs the fish commands listed in Round 2 §4 above.
+
+---
+
+## Round 4
+
+Escalation rework (D-161) applying **D-156** across core (`v4/tools.rs`, `v4/tools/git.rs`, `v4/rules.rs`) and `app/src/chat/rule-form.ts` together, removing all option-arity modelling outside the frozen table (`policy/tools.rs`) and fixing all three High findings plus test gaps from `docs/agents/reviews/M1-39-rev4-p3-tools-rules-round3.md`.
+
+### 1. What changed and why (D-156, D-161)
+
+Per **D-156**:
+- When looking for triggers, code, and pinned programs, **no word is ever consumed as an option's value**.
+- Any word that could be a trigger under some reading, any letter in a short-option cluster that could be one, and any form that could supply code (`-e`, `-f`, `-W…` including `-Wsource=`, `--source`, `-E`, `-i`, `-l`, `--eval`, `--exec`, `--include`, `--load`) produces plain `Unread` and is rejected in Allow prefix validation (core, daemon, and app in 1-to-1 parity).
+- Over-approximating is accepted (it only adds `Unread`, never misses a hit). Round 2's `git -Csrc` finding is closed by D-156: a `c` in a short-option cluster fires `-c` (`CodeRunnerInlineCode { tool: "git" }`).
+- Arities remain **only** where the frozen table (`crates/atrium-core/src/policy/tools.rs`) lists them: the Search rows' flag tables (`RG_FLAGS`, `GREP_FLAGS`), `dev`'s forbidden flags (`is_forbidden_flag` / `HomeReadOnlySpec::forbidden`), and the §4 wrappers (handled by P1).
+- In `awk`, `git`, `cp`, `tar`, and interpreters, `--` terminates trigger scanning only when no preceding flag without `=` (and, for `tar`, no old-style bundled key) could have consumed `--` as its value — closing `--` bypasses (e.g. `tar -f -- -x`, `git diff -S -- --ext-diff`, `awk -f prog.awk -F -- -Wsource=1`, `cp -t -- -R`) with zero arity tables while preserving `git diff -- --ext-diff`, `cp -- -R`, `tar -cf out.tar -- -x`, and `gawk -f prog.awk -- -Wsource=…`.
+
+### 2. Every arity rule removed outside the frozen table
+
+| File | Removed arity modelling | Replacement under D-156 |
+|---|---|---|
+| `crates/atrium-core/src/policy/v4/tools.rs` | `ShortOptArity` enum (`Bool` / `TakesValue` / `OptionalAttached`) | Removed completely. |
+| `crates/atrium-core/src/policy/v4/tools.rs` | Interpreter arities: `InterpOpt`, `interpreter_short_arity`, `interpreter_long_takes_separate_value`, `parse_interpreter_opt` (`python`/`node`/`perl`/`ruby` short/long value-taking options) | `match_inline_flag_no_arity`: inspects every token with `i += 1` (never skipping a word); any matching letter in a short-option cluster records inline code. |
+| `crates/atrium-core/src/policy/v4/tools.rs` | `awk`/`gawk`/`mawk` arities: `awk_opt_step` (`-F`/`-v`/`-W` value consumption, bool list `b..V`, `--field-separator`/`--assign` skipping next word) | `awk_tok_supplies_code` + `has_competing_awk_code_flags` / `_pure`: never skips words; treats `-f`, `-e`, `-E`, `-i`, `-l`, `-W…` (attached or separate, anywhere in a short cluster), `--file`, `--source`, `--eval`, `--exec`, `--include`, `--load` (and unambiguous prefixes via `tools::is_forbidden_flag`), and non-UTF-8 dash tokens as competing code sources. Also requires pinned program arg (`argv[2]`) not to start with `-`. |
+| `crates/atrium-core/src/policy/v4/tools.rs` & `v4/rules.rs` | `sed` arities: `--line-length` skipping next word, `-l80` cluster break, `--in-place=…`, `-i ''` consuming empty suffix, `-i.bak` / `-i.ef` / `-i.ref` cluster breaks, `-e`/`--expression` and `-f`/`--file` skipping next word (`i += 2`) | `is_sed_safe_bool_long` / `is_sed_safe_bool_short` + `sed_trailing_flag_is_competing` + `has_competing_sed_flags_budgeted` / `_pure`: pins `-f`/`--file <prog>` (non-empty, not starting with `-`) only when all trailing flags before `--` are pure zero-arg booleans (`-n`/`-E`/`-r`/`-s`/`-u`/`-z` and long equivalents); inline `sed` advances `i += 1` always, inspects separate `-e`/`--expression` scripts without skipping words, and fails closed to plain `Unread` on `-i`, `-l`, `--in-place`, `--line-length`, attached `-e…`, and any unknown flag. |
+| `crates/atrium-core/src/policy/v4/tools.rs` | `find_primary_value_arity` (`-name`, `-iname`, `-path`, `-regex`, etc. skipping 1 word) | Removed; `find` scans every word in `&unit.argv[1..]` for `-exec`/`-execdir`/`-ok`/`-okdir` with no skipping. |
+| `crates/atrium-core/src/policy/v4/tools.rs` | Git global & subcommand arities: `GitPathspecFlag`, `GitGlobalOpt`, `git_global_short_arity`, `parse_git_global_opt`, `git_subcommand_short_arity`, `git_subcommand_long_takes_separate_value`, `git_subcommand_opt_step` (including `--unified` taking a separate value) | `classify_git` Case 1 (no leading global flag: unambiguous subcommand at `argv[1]`) uses no-arity `git_subcommand_has_flag_trigger_budgeted` and `git_subcommand_has_subarg_trigger_budgeted` (`matches_git_flag_pure` / `matches_flag_trigger_raw`). Case 2 (leading `-…` or non-UTF-8 at `argv[1]`) performs a single linear $O(N)$ pass over `&unit.argv[1..]` with zero value consumption, tracking candidate subcommand triggers (`seen_trigger_sub`), global flag triggers (`-c`, `--config-env`, `--exec-path`), derived destination subcommands (`clone`, `checkout`), and prioritized CR-12/wildcard `best_subcmd` (`git_selects_by_name` > `git_wildcard_pathspec` > other) while keeping `writes = true`, `home_readonly_eligible = false`, and operand roles `Path`/`ReadWrite`. |
+| `crates/atrium-core/src/policy/v4/tools/git.rs` | `parse_git_global_opt` / `GitPathspecFlag` arity walking in `check_git_selection_into_impl` | Locates `subcmd_idx` from `effects.roles` or `effects.subcommand`, honors `--literal-pathspecs` / `--noglob-pathspecs` only while no other unmodeled global token preceded them (`!saw_other_global`, failing closed on `git -C --literal-pathspecs show …`), and always re-enables on `--glob-pathspecs`. |
+| `crates/atrium-core/src/policy/v4/tools.rs` | `DerivedDestinationWriter` arities: `cp_short_arity`, `tar_short_arity` (including `-s` as value-taking), `derived_writer_long_takes_separate_value`, `derived_writer_opt_step`, and `tar` old-style bundled `skip_args` counter | `matches_derived_writer_flag`: never skips words; matches any trigger letter in a short-option cluster or old-style `tar` key and any long-option prefix (`--recursive`, `--archive`, `--extract`, `--get`). |
+| `crates/atrium-core/src/policy/v4/rules.rs` | Arity-dependent Git/awk/sed validation helpers | Calls no-arity `git_subcommand_has_flag_trigger_pure`, `git_subcommand_has_subarg_trigger_pure` (requiring pinned action at `rest[0]` for `bisect`/`submodule`), `has_competing_awk_code_flags_pure`, `has_competing_sed_flags_pure`, and no-skip `validate_sed_inline_prefix_budgeted`. |
+| `app/src/chat/rule-form.ts` | `ShortOptArity`, `gitSubcommandShortArity`, `gitSubcommandLongTakesSeparateValue`, and all arity-based skips in `findGitSubcommandTriggerFlag`, `hasCompetingAwkFlags`, `hasCompetingSedFlags`, `isSedPrefixSafe` | Rewritten in exact 1-to-1 parity with core (`matchesGitFlag`, `findGitSubcommandTriggerFlag`, `hasGitSubcommandSubargTrigger`, `hasCompetingAwkFlags` with `AWK_EXTRA_CODE_*`, `hasCompetingSedFlags` with `SED_SAFE_BOOL_*`, and no-skip `isSedPrefixSafe`). |
+
+### 3. Review 3 findings closed and clarification on `["gawk", "-f", "prog.awk"]`
+
+1. **Finding 1 (GNU `tar -s -x -f archive.tar`):** Removing `tar_short_arity` ensures `-s` never consumes `-x`; `tar -s -x -f archive.tar` emits `UnreadReason::DerivedDestinations { tool: "tar" }`, so an exact Allow does not cover it and does not suppress a lower-ranked Global Deny.
+2. **Finding 2 (`gawk -f prog.awk '-Wsource=BEGIN{print 1}'`, attached & separate):** Treating `-W…` (and `--source`, `-e`, `-E`, `-i`, `-l`, `--eval`, `--exec`, `--include`, `--load`) as competing code sources produces plain `UnreadReason::CodeRunnerInlineCode { tool: "gawk" }` on both attached `'-Wsource=BEGIN{print 1}'` and separate `-W 'source=BEGIN{print 1}'`.
+   - **Clarification vs prompt wording:** Per frozen `crates/atrium-core/src/policy/tools.rs` (`awk_code_runner("gawk")` carries `ProgramPin::FlagValue { flags: &["-f", "--file"] }`, identical to `awk` and `mawk`), Review 3 Finding 2 ("treat code-supplying `-W` forms as competing program sources, producing plain Unread and rejecting such Allow prefixes"), and Review 3 Test Gaps ("higher-ranked Allow versus lower-ranked Deny"), the clean pinned prefix `["gawk", "-f", "prog.awk"]` stays valid at creation and covers clean `gawk -f prog.awk data.txt`, while **never** covering `-W…` forms (letting lower-ranked Global Deny win). Allow prefixes containing `-W…` (`["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"]`, `["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"]`, `["gawk", "-f", "prog.awk", "-W"]`, `["gawk", "-f", "-Wsource=1"]`) are rejected at creation in core, daemon, and app and marked invalid when already stored.
+3. **Finding 3 (`git diff --unified --ext-diff`):** Removing `git_subcommand_long_takes_separate_value` ensures `--unified` never consumes `--ext-diff`; classification emits `UnreadReason::CodeRunnerInlineCode { tool: "git diff" }`, Allow prefix `["git", "diff", "--unified", "--ext-diff"]` is rejected at creation (core, daemon, app) and marked invalid when stored, and neither exact Allow, valid `["git", "diff"]` prefix, nor stored-invalid prefix covers it (Global Deny wins).
+4. **Round 2 `git -Csrc` closed by D-156:** `git -Csrc status` now emits `UnreadReason::CodeRunnerInlineCode { tool: "git" }` and is not covered by an exact Allow; tests in `v4/tools/tests.rs` and `v4/rules/tests.rs` reflect D-156.
+
+### 4. New and updated tests
+
+- `crates/atrium-core/src/policy/v4/tools/tests.rs`:
+  - Updated `conditional_runner_sed_script_parser_and_program_pin` so all `-i`/`-i ''`/`-i.bak`/`--in-place=`/`--line-length` forms assert plain `CodeRunnerInlineCode { tool: "sed" }` under D-156.
+  - Replaced Round 3's two tests with `d156_git_trigger_detection_never_consumes_option_values` (covering `git -Csrc status`, `git diff --unified --ext-diff`, `git -C repo diff --unified --ext-diff`, `git -C status show HEAD:.env`, `git -C branch status -- '*.rs'`, `git -C --literal-pathspecs show HEAD -- ':!.env'`, and all non-arity subcommand triggers) and `d156_arities_stay_only_in_frozen_table_and_review3_findings_1_and_2` (covering frozen `rg`/`grep` tables, `tar -s -x -f archive.tar`, attached & separate `gawk -Wsource`, `cp`, `sed`, `find`, and interpreters under D-156).
+- `crates/atrium-core/src/policy/v4/rules/tests.rs`:
+  - Replaced Round 3's validation/coverage test with `d156_no_option_value_consumption_in_validation_and_coverage` (`git -Csrc status` uncovered; D-156 validation matrix for `git`, `awk`/`gawk`, `sed`).
+  - Added `round4_review3_findings_1_2_3_coverage_and_precedence` covering Review 3's three test gaps: `tar -s -x -f archive.tar` exact Allow vs Global Deny; attached and separate `gawk -f prog.awk -Wsource=…` higher-ranked Thread Allow `["gawk", "-f", "prog.awk"]` vs lower-ranked Global Deny `["gawk"]` (plus clean pinned control and stored-invalid `["gawk", "-f", "prog.awk", "-Wsource=…"]`); and `git diff --unified --ext-diff` exact/prefix/stored-invalid Allow vs Global Deny.
+- `crates/atrium-daemon/tests/create_rule.rs`:
+  - Added `["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"]`, `["gawk", "-f", "prog.awk", "-W", "source=BEGIN{print 1}"]`, `["gawk", "-f", "prog.awk", "-W"]`, `["git", "diff", "--unified", "--ext-diff"]`, and `["git", "diff", "-S", "--ext-diff"]` to `create_rule_rejects_unpinned_allow_code_runner_prefixes_and_invalid_globs`; added `["gawk", "-f", "prog.awk"]` to accepted pinned prefixes; seeded stored `["git", "diff", "--unified", "--ext-diff"]` and `["gawk", "-f", "prog.awk", "-Wsource=BEGIN{print 1}"]` in `list_rules_keeps_stored_invalid_rules_visible_and_marked_invalid`.
+- `app/src/chat/rule-form.test.ts`:
+  - Updated D-156 validation cases (`git diff --unified --ext-diff`, attached & separate `gawk -Wsource`, `-i`/`-l`/`-E`, `awk`/`sed` cluster triggers) and added stored-invalid checks (`invGawkWSource`, `invGawkWSep`, `invGitDiffExt`).
+
+### 5. Verification
+
+#### Run by worker (allowed under D-123)
+- `cargo fmt --all` — clean
+- `cargo check -p atrium-core -p atrium-daemon -p atrium-protocol --tests` — clean (0 errors, 0 warnings)
+- No `cargo clippy`, `cargo test`, `pnpm`, or real providers run by worker (D-123).
+
+#### Exact commands for the orchestrator's verification task (fish-compatible)
+```fish
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p atrium-core policy::v4::tools:: -- --nocapture
+cargo test -p atrium-core policy::v4::rules:: -- --nocapture
+cargo test -p atrium-protocol policy::tests:: -- --nocapture
+cargo test -p atrium-daemon --test create_rule -- --nocapture
+cargo test --workspace --no-fail-fast
+./scripts/check-protocol-ts
+pnpm --dir app run typecheck
+pnpm --dir app test -- src/chat/rule-form.test.ts src/chat/rules.test.ts src/ui/rules-list.test.ts
+```
