@@ -1110,3 +1110,11 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **The brief is approved, but the task isn't started.** It starts with a separate go from the driver once the agy quota is back. (On 2026-11-24 the quota ran out during P2 round 13, with a reset in about 3 h.)
 - **Possible product bug:** if `QuestionAsked` reaches the session before its ledger record is written, that is a product ordering bug, and M1-44 fixes it in the product.
 
+## D-168 — 2026-11-24 — Pedro: merge M1-42 (N16) into `dev`
+**Decided by Pedro (driver).** M1-42 (`agent/neon/M1-42-n16-bridge-test-race` @ `1e59e5eb`) is merged into `dev` as `6281107a`. It was approved in Sonnet review round 4 with no findings (D-120, D-162; `reviews/M1-42-n16-bridge-test-race-round4.md`) after 5 rounds.
+- **What changed:** only the bridge tests' fake daemon (`mod tests` in `app/src-tauri/src/bridge.rs`) and the handoff.
+  - It now answers `SubscribeInbox` and registers the connection under one lock, like `Hub::subscribe_inbox`.
+  - It counts live and answered subscriptions, and every pushing test waits for its subscription.
+- **No rebase was needed.** The orchestrator's round 5 verification ran on the branch merged into `dev` with P3 (`82f8d115`), and `dev` has changed only in `docs/` since. It was clean on macOS: fmt and workspace clippy clean; `bridge::` ×300 with 0 failures. The workspace had one failure, N18, unrelated and routed to M1-44.
+- **N16 is closed.**
+
