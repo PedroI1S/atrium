@@ -15,7 +15,7 @@ use atrium_protocol::policy::{
 use atrium_protocol::thread::ThreadId;
 
 use super::limits;
-use super::model::{ComputeBudget, FoldRules, FsCaps};
+use super::model::{ComputeBudget, FoldRules, FsCaps, ProtectedSet};
 use super::v4;
 use super::{SessionGate, input_sha256};
 use crate::{ApprovalLedger, Binding, PolicyEngine, PolicyInput, PolicyVerdict, RequestKey, Store};
@@ -251,8 +251,8 @@ fn evaluate_sync(
     let protected = match v4::paths::sensitive::build_protected_set(
         &home_bytes,
         &cwd_bytes,
-        data_bytes,
-        prot_bytes,
+        data_bytes.clone(),
+        prot_bytes.clone(),
         FoldRules::REV4,
         &resolver,
         &mut protected_caps,
@@ -260,8 +260,27 @@ fn evaluate_sync(
     ) {
         Ok(p) => p,
         Err(_) => {
+            // The protected set could not be built: no identity is known, so
+            // the call is Exhausted (Ask in every setting, §2). A higher step
+            // of §1 still decides (§8; P5 review 1, finding 9): the call is
+            // evaluated against the names alone, and only what a missing
+            // identity can't create is kept, a hit found by name or by the
+            // best-effort pass, a size limit, or a winning Deny rule.
+            let names_only = ProtectedSet {
+                home: home_bytes,
+                cwd: cwd_bytes,
+                atrium_data_paths: data_bytes,
+                atrium_protected_paths: prot_bytes,
+                folds: FoldRules::REV4,
+                ..ProtectedSet::default()
+            };
+            let eval = v4::evaluate::evaluate_call(&input, rules, &names_only, &resolver);
+            let verdict = match eval.verdict {
+                v @ (PolicyVerdict::HardDeny { .. } | PolicyVerdict::Deny { .. }) => v,
+                PolicyVerdict::Allow { .. } | PolicyVerdict::Ask => PolicyVerdict::Ask,
+            };
             return Ok(Evaluated {
-                verdict: PolicyVerdict::Ask,
+                verdict,
                 remember_matcher: None,
                 unread: Some(UnreadNotice::Exhausted),
             });

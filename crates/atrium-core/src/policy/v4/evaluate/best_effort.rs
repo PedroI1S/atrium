@@ -145,18 +145,11 @@ const MAX_SEARCH_GLOB_VARIANTS: usize = 256;
 /// Optional per-call context passed by `evaluate_call` so modeled quoted
 /// literals (whose provenance has zero unquoted glob characters, §3 / §10 row 9)
 /// are not spuriously glob-matched as patterns by the best-effort pass.
+#[derive(Default)]
 pub(super) struct BestEffortOptions<'a> {
     /// Exact modeled `(unit_index_in_top_level, argv_index)` pairs that are
     /// known to have NO unquoted glob characters in exact model provenance.
     pub(super) quoted_literal_words: Option<&'a HashSet<Vec<u8>>>,
-}
-
-impl Default for BestEffortOptions<'_> {
-    fn default() -> Self {
-        Self {
-            quoted_literal_words: None,
-        }
-    }
 }
 
 /// Runs the §2 best-effort pass over `record`, appending every hit found into
@@ -991,14 +984,12 @@ fn unwrap_simple_be_mode(
                             || match_gnu_long_opt(w, "--argv0", 5) == Some(None)
                             || w == "--arg0"
                             || short_cluster_takes_next(w, "uCPaS")
-                        {
-                            idx += 2;
-                        } else if !w.contains('=')
-                            && !is_known_env_noarg_opt(w)
-                            && (opt_takes_val
-                                || cur.get(idx + 2).is_some_and(|n2| {
-                                    (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
-                                }))
+                            || (!w.contains('=')
+                                && !is_known_env_noarg_opt(w)
+                                && (opt_takes_val
+                                    || cur.get(idx + 2).is_some_and(|n2| {
+                                        (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
+                                    })))
                         {
                             idx += 2;
                         } else {
@@ -1414,10 +1405,8 @@ fn scan_top_level_meta(
                       budget: &mut ComputeBudget|
      -> Result<(), Exhausted> {
         if *has_content {
-            budget.charge_alloc(
-                std::mem::size_of::<BeUnitMeta>()
-                    + groups.len() * std::mem::size_of::<(BeCompound, u32)>(),
-            )?;
+            budget
+                .charge_alloc(std::mem::size_of::<BeUnitMeta>() + std::mem::size_of_val(groups))?;
             out.push(BeUnitMeta {
                 join,
                 close_join: None,
@@ -2791,6 +2780,9 @@ fn extract_piped_echo_for_source(
     Ok(None)
 }
 
+/// Candidate working directories, and whether the real one may be unknown.
+type CwdCands = (Vec<Vec<u8>>, bool);
+
 /// Extracts shifted per-unit cwd candidates when `raw_argv` starts with `env`
 /// (or `$(which env)`) and carries `-C DIR` / `-CDIR` / `--chdir` / `--ch*`.
 fn extract_env_chdir_cands(
@@ -2800,7 +2792,7 @@ fn extract_env_chdir_cands(
     tracker: &BeCwdTracker,
     folds: FoldRules,
     budget: &mut ComputeBudget,
-) -> Result<Option<(Vec<Vec<u8>>, bool)>, Exhausted> {
+) -> Result<Option<CwdCands>, Exhausted> {
     if raw_argv.is_empty() {
         return Ok(None);
     }
@@ -2873,12 +2865,11 @@ fn extract_env_chdir_cands(
                     }
                     continue;
                 }
-                if short_cluster_takes_next(w, "uPaS") {
-                    j += 2;
-                } else if !is_known_env_noarg_opt(w)
-                    && raw_argv
-                        .get(j + 2)
-                        .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+                if short_cluster_takes_next(w, "uPaS")
+                    || (!is_known_env_noarg_opt(w)
+                        && raw_argv.get(j + 2).is_some_and(|n2| {
+                            (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
+                        }))
                 {
                     j += 2;
                 } else {
@@ -2890,13 +2881,11 @@ fn extract_env_chdir_cands(
                 if matches!(w, "--unset" | "--split-string" | "--argv0")
                     || match_gnu_long_opt(w, "--split-string", 5) == Some(None)
                     || match_gnu_long_opt(w, "--unset", 4) == Some(None)
-                {
-                    j += 2;
-                } else if !w.contains('=')
-                    && !is_known_env_noarg_opt(w)
-                    && raw_argv
-                        .get(j + 2)
-                        .is_some_and(|n2| (n2.starts_with('-') && n2.len() > 1) || n2.contains('='))
+                    || (!w.contains('=')
+                        && !is_known_env_noarg_opt(w)
+                        && raw_argv.get(j + 2).is_some_and(|n2| {
+                            (n2.starts_with('-') && n2.len() > 1) || n2.contains('=')
+                        }))
                 {
                     j += 2;
                 } else {
@@ -3208,7 +3197,7 @@ fn clone_bytes(b: &[u8], budget: &mut ComputeBudget) -> Result<Vec<u8>, Exhauste
 
 fn clone_bytes_vec(v: &[Vec<u8>], budget: &mut ComputeBudget) -> Result<Vec<Vec<u8>>, Exhausted> {
     budget.charge(v.len().max(1) as u64)?;
-    budget.charge_alloc(v.len() * std::mem::size_of::<Vec<u8>>())?;
+    budget.charge_alloc(std::mem::size_of_val(v))?;
     let mut out = Vec::with_capacity(v.len());
     for item in v {
         out.push(clone_bytes(item, budget)?);
@@ -5843,7 +5832,7 @@ fn reads_stdin_as_code_budgeted(
             None => return Ok(true),
             Some(name) => {
                 let mut e = Vec::with_capacity(eff.len());
-                budget.charge_alloc(eff.len() * std::mem::size_of::<String>())?;
+                budget.charge_alloc(std::mem::size_of_val(eff))?;
                 e.push(name);
                 for a in args {
                     e.push(clone_str_budgeted(a, budget)?);

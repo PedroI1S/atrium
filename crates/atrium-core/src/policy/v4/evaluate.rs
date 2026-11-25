@@ -700,8 +700,9 @@ fn evaluate_command(
     //     units (e.g. `dd if=link`, `cat --file=link`) so symlinks to hard-deny
     //     targets behind `=` are caught on disk; only `HardDenyHit` is promoted
     //     so ordinary non-path flag values (`--color=auto`) never emit Unread.
-    if !budget.is_exhausted() && !parsed.units.is_empty() {
-        if let Err(e) = resolve_kv_hard_deny_aliases(
+    if !budget.is_exhausted()
+        && !parsed.units.is_empty()
+        && let Err(e) = resolve_kv_hard_deny_aliases(
             &parsed.units,
             &effects,
             &effective_start_cwd,
@@ -710,9 +711,9 @@ fn evaluate_command(
             fs_caps,
             budget,
             &mut outcome.parts,
-        ) {
-            record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-        }
+        )
+    {
+        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
     }
 
     // 4. §2 best-effort pass over raw text and tolerant-lexer units.
@@ -732,10 +733,9 @@ fn evaluate_command(
         }
     }
 
-    // 5. P3: evaluate rules.
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
+    // 5. P3: evaluate rules (a winning Deny decides even past exhaustion,
+    //    §1 step 3 before step 5).
+    let (rule_coverage, rules_exhausted) = {
         let rule_ctx = RuleEvalContext {
             check: input.check,
             preset: input.preset,
@@ -747,14 +747,11 @@ fn evaluate_command(
             outcomes: &outcome.parts,
             folds: &folds,
         };
-        match evaluate_rules(&rule_ctx, rules, budget) {
-            Ok(cov) => cov,
-            Err(e) => {
-                record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-                RuleCoverage::default()
-            }
-        }
+        evaluate_rules_reserving_deny(&rule_ctx, rules, budget)
     };
+    if let Some(e) = rules_exhausted {
+        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+    }
 
     // 6. Compute Home read-only eligibility across uncovered units (including
     //    Home's newline guard and recursive-root strictly-inside-home guard).
@@ -795,6 +792,7 @@ fn evaluate_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_kv_hard_deny_aliases(
     units: &[CommandUnit],
     effects: &[ToolEffects],
@@ -1247,9 +1245,7 @@ fn evaluate_paths(
     }
 
     let empty_be = BestEffortRecord::default();
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
+    let (rule_coverage, rules_exhausted) = {
         let rule_ctx = RuleEvalContext {
             check: input.check,
             preset: input.preset,
@@ -1261,14 +1257,11 @@ fn evaluate_paths(
             outcomes: &outcome.parts,
             folds: &folds,
         };
-        match evaluate_rules(&rule_ctx, rules, budget) {
-            Ok(cov) => cov,
-            Err(e) => {
-                record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-                RuleCoverage::default()
-            }
-        }
+        evaluate_rules_reserving_deny(&rule_ctx, rules, budget)
     };
+    if let Some(e) = rules_exhausted {
+        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+    }
 
     let home_readonly_all = match input.check.kind {
         ToolKind::Read => true,
@@ -1408,17 +1401,10 @@ fn evaluate_fetch(
         outcomes: &outcome.parts,
         folds: &folds,
     };
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
-        match evaluate_rules(&rule_ctx, rules, budget) {
-            Ok(cov) => cov,
-            Err(e) => {
-                record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-                RuleCoverage::default()
-            }
-        }
-    };
+    let (rule_coverage, rules_exhausted) = evaluate_rules_reserving_deny(&rule_ctx, rules, budget);
+    if let Some(e) = rules_exhausted {
+        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+    }
 
     ensure_exhausted_recorded(budget, &mut outcome.parts);
     let verdict = decide(outcome, &rule_coverage, input.preset, false);
@@ -1541,17 +1527,10 @@ fn evaluate_mcp(
         outcomes: &outcome.parts,
         folds: &folds,
     };
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
-        match evaluate_rules(&rule_ctx, rules, budget) {
-            Ok(cov) => cov,
-            Err(e) => {
-                record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-                RuleCoverage::default()
-            }
-        }
-    };
+    let (rule_coverage, rules_exhausted) = evaluate_rules_reserving_deny(&rule_ctx, rules, budget);
+    if let Some(e) = rules_exhausted {
+        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+    }
 
     ensure_exhausted_recorded(budget, &mut outcome.parts);
     let verdict = decide(outcome, &rule_coverage, input.preset, false);
@@ -1585,17 +1564,10 @@ fn evaluate_none(
         outcomes: &outcome.parts,
         folds: &folds,
     };
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
-        match evaluate_rules(&rule_ctx, rules, budget) {
-            Ok(cov) => cov,
-            Err(e) => {
-                record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
-                RuleCoverage::default()
-            }
-        }
-    };
+    let (rule_coverage, rules_exhausted) = evaluate_rules_reserving_deny(&rule_ctx, rules, budget);
+    if let Some(e) = rules_exhausted {
+        record_exhausted(&mut outcome.parts, PartId::WholeCall, e.reason);
+    }
 
     ensure_exhausted_recorded(budget, &mut outcome.parts);
     // `ToolSubject::None` is allowed in every preset (including Careful),
@@ -1780,14 +1752,9 @@ fn evaluate_unknown(
         outcomes: &outcome.parts,
         folds: &folds,
     };
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
-        match evaluate_rules(&rule_ctx, rules, budget) {
-            Ok(cov) => cov,
-            Err(_) => RuleCoverage::default(),
-        }
-    };
+    // The subject is already Exhausted (Ask in every setting), so an extra
+    // exhaustion of the rules' run changes nothing.
+    let (rule_coverage, _) = evaluate_rules_reserving_deny(&rule_ctx, rules, budget);
 
     let verdict = decide(outcome, &rule_coverage, input.preset, false);
     CallEvaluation {
@@ -1800,6 +1767,41 @@ fn evaluate_unknown(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Rules for a call whose budget may run out (§1 step 3 comes before step 5,
+/// §8 "unless a higher step of §1 already decided"; P5 review 1, finding 9).
+///
+/// The rules run on the call's budget. If it is spent, or runs out during
+/// the run, they run again on a reserved budget of their own, sized like a
+/// call's, and only that run's winning Deny is kept: an Exhausted part asks
+/// in every setting (step 5), so Allow coverage would never be used. The
+/// rules see the units and best-effort units found before exhaustion; a
+/// unit never lexed can't match. Returns the exhaustion of the call's
+/// budget, if this run caused it, for the caller to record.
+fn evaluate_rules_reserving_deny(
+    ctx: &RuleEvalContext<'_>,
+    rules: &[Rule],
+    budget: &mut ComputeBudget,
+) -> (RuleCoverage, Option<Exhausted>) {
+    let mut caused = None;
+    if !budget.is_exhausted() {
+        match evaluate_rules(ctx, rules, budget) {
+            Ok(cov) => return (cov, None),
+            Err(e) => caused = Some(e),
+        }
+    }
+    let mut reserve = ComputeBudget::with_default_limits();
+    let deny = evaluate_rules(ctx, rules, &mut reserve)
+        .ok()
+        .and_then(|cov| cov.deny);
+    (
+        RuleCoverage {
+            deny,
+            ..RuleCoverage::default()
+        },
+        caused,
+    )
+}
 
 /// `dev` `Home::root_ok`: recursive search roots in Home must lie strictly
 /// inside `home` (not `home` itself or an ancestor/sibling outside `home`)
@@ -2021,11 +2023,9 @@ fn finalize_exhausted_or_ask(
         outcomes: &outcome.parts,
         folds: &folds,
     };
-    let rule_coverage = if budget.is_exhausted() {
-        RuleCoverage::default()
-    } else {
-        evaluate_rules(&rule_ctx, rules, budget).unwrap_or_default()
-    };
+    // The outcome already holds an Exhausted part, so a further exhaustion
+    // in the rules' run changes nothing.
+    let (rule_coverage, _) = evaluate_rules_reserving_deny(&rule_ctx, rules, budget);
     let verdict = decide(&outcome, &rule_coverage, input.preset, home_readonly_all);
     CallEvaluation {
         verdict,
