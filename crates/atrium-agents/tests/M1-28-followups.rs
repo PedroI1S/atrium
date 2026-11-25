@@ -500,7 +500,8 @@ for line in sys.stdin:
 
     let ledger = RealLedger::new(Provider::Claude, &dir, Preset::Careful, true).await;
     let deadline = Duration::from_millis(150);
-    let mut session = ClaudeAdapter::new(claude_opts(deadline))
+    let mut session = ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))
+        .with_withdraw_timeout(deadline)
         .start(
             claude_cfg(&dir, script, ledger.gate.clone()),
             Transport::Local,
@@ -1696,7 +1697,8 @@ for line in sys.stdin:
     let (gate, controls) = DelayedWithdrawGate::new(session_gate, filler_count);
 
     let wait_deadline = Duration::from_millis(150);
-    let mut session = ClaudeAdapter::new(claude_opts(wait_deadline))
+    let mut session = ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))
+        .with_withdraw_timeout(wait_deadline)
         .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
         .await
         .unwrap();
@@ -2300,7 +2302,8 @@ for line in sys.stdin:
         make_session_gate_with_ledger(Provider::Claude, &dir, Preset::Careful).await;
     let (gate, release_withdraw) = BlockedDeliveredWithdrawGate::new(session_gate);
 
-    let mut session = ClaudeAdapter::new(claude_opts(Duration::from_millis(150)))
+    let mut session = ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))
+        .with_withdraw_timeout(Duration::from_millis(20))
         .start(claude_cfg(&dir, script, gate.clone()), Transport::Local)
         .await
         .unwrap();
