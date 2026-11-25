@@ -90,5 +90,52 @@ All commands below are fish-safe (loops and background load wrapped in `bash -c`
    - Temporarily revert the `drain_withdrawals` line in `crates/atrium-agents/src/claude/adapter.rs` from `self.withdraw_timeout.unwrap_or(self.options.gate_deadline)` back to `self.options.gate_deadline`, then run:
      ```sh
      cargo test -p atrium-agents --lib withdraw_timeout_bounds_drain_without_shrinking_gate_deadline -- --exact
+     cargo test -p atrium-agents --lib with_withdraw_timeout_propagates_through_start -- --exact
      ```
-   - Expected: fails after 2 s with `drain_withdrawals did not honor withdraw_timeout` (waiting on the 60 s `gate_deadline` instead of the 20 ms `withdraw_timeout`). Restore the line afterwards.
+   - Expected: both fail after their timeout (waiting on the 60 s `gate_deadline` instead of the 20 ms `withdraw_timeout`). Restore the line afterwards.
+
+## Round 2
+
+Addressed every finding and the open point from Sonnet's round 1 review (`.orchestration/review-input/M1-44-n18-delivered-question-withdraw-flake-round1.md`):
+
+1. **Finding 1 (Medium) & Finding 6 (Info) — deterministic late-ticket test & proof of cause:**
+   - Added `claude::adapter::tests::late_question_ticket_denies_without_event_and_withdraws_orphan` in `crates/atrium-agents/src/claude/adapter.rs` with zero sleeps (`tokio::sync::watch` barriers + `Semaphore::acquire_many`).
+   - Uses a gate whose `question_ticket` blocks on a watch channel and then returns `Some(ApprovalTicket::new("L1", false))`, with `gate_deadline = 20 ms`.
+   - Feeds `AskUserQuestion`, waits for the `control_response` deny on the provider pipe, asserts no `AgentEvent::QuestionAsked` is emitted, asserts both `gate_in_flight == 1` and `gate_permits` remain held after the timeout, releases the gate, and asserts `gate.withdraw` is called exactly once for `"L1"` while the permit remains held until `withdraw` completes and is released afterwards.
+   - This deterministically pins the `OrphanGuard::drop` cleanup path that the fix relies on and proves that a slow `question_ticket` past `gate_deadline` produces a late ticket that must be withdrawn (explaining how the old 150 ms `gate_deadline` setup left a pending row when `BlockedDeliveredWithdrawGate` blocked withdrawals).
+
+2. **Finding 2 (Low) — single `Actor` construction site & Change Request:**
+   - Kept `#[doc(hidden)] ClaudeAdapter::with_withdraw_timeout` so `ClaudeOptions` (a public struct without `#[non_exhaustive]`) is not modified, respecting the brief's no-public-signature-change rule.
+   - Changed `Actor::new` (`crates/atrium-agents/src/claude/adapter.rs`) — the single construction site for `Actor` — to accept `withdraw_timeout: Option<Duration>` directly as a parameter instead of post-construction field mutation, and documented this invariant on `Actor::new`. No caller can silently omit or lose the override.
+   - **Change request:** The next time `ClaudeOptions` is allowed to change (contract / public API bump), move `withdraw_timeout: Option<Duration>` into `ClaudeOptions` (matching `CodexOptions::withdraw_timeout` in `crates/atrium-agents/src/codex/adapter.rs:65`) and remove `ClaudeAdapter::withdraw_timeout` and `ClaudeAdapter::with_withdraw_timeout`.
+
+3. **Finding 3 (Low) — other effects of keeping `gate_deadline` at 20 s:**
+   - Restoring `gate_deadline` from 150 ms to 20 s in the three `M1-28-followups.rs` tests also restores:
+     - `wait_for_in_flight_gates`'s shutdown wait cap (`crates/atrium-agents/src/claude/adapter.rs:1152`, `gate_deadline.min(500 ms)`) from 150 ms to 500 ms;
+     - the `PreToolUse` hook timeout (`crates/atrium-agents/src/claude/adapter.rs:814`, `gate_deadline + 10 s`) from 10 s to 30 s.
+   - In `claude_hung_withdrawals_finish_within_one_deadline`, the `< 450 ms` shutdown bound remains safe because `wait_for_approvals(&mut session, 5).await` and `assert_eq!(ledger.gate.asked().len(), 5)` (`crates/atrium-agents/tests/M1-28-followups.rs:521-522`) already run before `shutdown(session).await` (line 525), ensuring all 5 gate checks have completed and `gate_in_flight == 0` when `wait_for_in_flight_gates` runs.
+
+4. **Finding 4 (Low) — fallback & propagation unit tests:**
+   - Extended `claude::adapter::tests::withdraw_timeout_bounds_drain_without_shrinking_gate_deadline` with a second case (`withdraw_timeout = None`, `gate_deadline = 20 ms`) asserting that `drain_withdrawals` falls back to `gate_deadline`, detaches at ~20 ms (`>= 15 ms` and `< 1 s`), and stays bounded.
+   - Added `claude::adapter::tests::with_withdraw_timeout_propagates_through_start`, which calls `ClaudeAdapter::new(...).with_withdraw_timeout(20 ms).start(...)` through the public `AgentAdapter::start` path against a 60 s `gate_deadline` and verifies that a blocked withdrawal detaches promptly rather than blocking shutdown for 60 s.
+
+5. **Finding 5 (Low) — comments at the three `M1-28-followups.rs` call sites:**
+   - Added an explanatory comment at all three changed `ClaudeAdapter::new(claude_opts(ClaudeOptions::default().gate_deadline))` sites (`claude_hung_withdrawals_finish_within_one_deadline`, `claude_delayed_withdrawal_past_deadline_keeps_permit_and_cancels_orphan`, and `claude_delivered_question_blocked_withdrawals_stay_bounded_and_complete`) explaining that `gate_deadline` stays at its 20 s default because it also bounds real SQLite checks and tickets.
+   - Left `docs/agents/m1-must-fix.md` untouched (orchestrator closes N18 at merge).
+
+6. **Reviewer's open point — can a late, never-announced question reach the UI between `open_question` and `withdraw`?**
+   - **No.** Checked the full path from `Ledger::open_question` to SQLite reads:
+     - `Ledger::open_question` (`crates/atrium-core/src/policy/ledger.rs:134-142`) delegates to `Ledger::open` (`ledger.rs:70-109`), which calls `self.store.open_question(&key, turn)` (`ledger.rs:101`) and emits no events or notifications.
+     - `Requests::open_question` (`crates/atrium-core/src/store/requests.rs:207-211`) -> `Writer::open_row` (`store/requests.rs:42-89`) inserts a `requests` row with `status = 'pending'` and leaves `event_opened` at its schema default `0` (`crates/atrium-core/schema/0001_init.sql:113-114`).
+     - `event_opened = 1` and `cx.row.pq += 1` are set only when `AgentEvent::QuestionAsked` is recorded (`crates/atrium-core/src/store/writer.rs:885-906`).
+     - Every UI/attention/recovery query on `requests` filters on `event_opened = 1 AND event_closed = 0`: `refresh_attention` (`crates/atrium-core/src/store/writer.rs:157-159`) and `open_items` (`crates/atrium-core/src/store/writer.rs:651-652`).
+     - Only `Requests::open_count` (`crates/atrium-core/src/store/requests.rs:225-237`) counts `event_opened = 0` rows, solely for `MAX_PENDING_REQUESTS` capacity accounting in `Ledger::open`. Because a timed-out `question_ticket` never emits `AgentEvent::QuestionAsked`, it cannot surface in the UI or notifications before `OrphanGuard::drop` withdraws it.
+
+7. **Checks run in Round 2 (D-123):**
+   - `cargo fmt --all` and `cargo check -p atrium-agents --tests --examples` clean with 0 warnings. No test suites were run by the worker.
+   - Additional targeted unit tests for the orchestrator to verify:
+     ```sh
+     cargo test -p atrium-agents --lib late_question_ticket_denies_without_event_and_withdraws_orphan -- --exact
+     cargo test -p atrium-agents --lib withdraw_timeout_bounds_drain_without_shrinking_gate_deadline -- --exact
+     cargo test -p atrium-agents --lib with_withdraw_timeout_propagates_through_start -- --exact
+     ```
