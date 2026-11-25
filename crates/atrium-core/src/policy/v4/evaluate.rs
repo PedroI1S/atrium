@@ -1874,6 +1874,12 @@ fn home_recursive_root_ok(
 /// a JSON payload (`Mcp`/`Unknown`) while enforcing structural caps
 /// (`MAX_USES` string count, `MAX_BYTES` total string bytes) BEFORE any
 /// compute charge (D-150).
+/// Returns `true` if a JSON tool payload (`Mcp` / `Unknown`) exceeds the
+/// structural caps (`MAX_USES`, `MAX_BYTES`) before any compute charge (D-150).
+pub(crate) fn json_input_too_large(v: &Value) -> bool {
+    collect_json_strings_capped(v).is_err()
+}
+
 fn collect_json_strings_capped(v: &Value) -> Result<Vec<&str>, Cap> {
     let mut out: Vec<&str> = Vec::new();
     let mut total_bytes: usize = 0;

@@ -186,7 +186,10 @@ fn precheck_too_large(check: &ToolCheck) -> bool {
                 || glob.as_deref().is_some_and(|g| g.len() > limits::MAX_BYTES)
         }
         ToolSubject::Fetch { url } => url.len() > limits::MAX_BYTES,
-        ToolSubject::Mcp { .. } | ToolSubject::None | ToolSubject::Unknown => false,
+        ToolSubject::Mcp { .. } | ToolSubject::Unknown => {
+            v4::evaluate::json_input_too_large(&check.input)
+        }
+        ToolSubject::None => false,
     }
 }
 

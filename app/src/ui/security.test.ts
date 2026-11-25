@@ -65,34 +65,34 @@ describe("Settings → Security (contract rev 4 §2, §9, §11 item 3; CR-12, CR
     }
   });
 
-  it("matches every ASK_FILES, ASK_TREES, and ASK_NAME_PREFIXES entry in core deny.rs plus CR-17 stores", () => {
-    const denyRs = readFileSync(join(import.meta.dirname, "../../../crates/atrium-core/src/policy/deny.rs"), "utf8");
-    const extractStrings = (constName: string): string[] => {
-      const m = new RegExp(`const ${constName}:[^=]*=\\s*&\\[([\\s\\S]*?)\\];`).exec(denyRs);
-      if (!m) throw new Error(`${constName} not found in deny.rs`);
-      return Array.from(m[1]!.matchAll(/"([^"]+)"/g), (hit) => hit[1]!);
+  it("matches every ASK_FILES, ASK_TREES, and ASK_NAME_PREFIXES entry in core v4/paths/sensitive.rs", () => {
+    const sensitiveRs = readFileSync(
+      join(import.meta.dirname, "../../../crates/atrium-core/src/policy/v4/paths/sensitive.rs"),
+      "utf8",
+    );
+    const extractFirstTupleStrings = (constName: string): string[] => {
+      const m = new RegExp(`const ${constName}:[^=]*=\\s*&\\[([\\s\\S]*?)\\];`).exec(sensitiveRs);
+      if (!m) throw new Error(`${constName} not found in v4/paths/sensitive.rs`);
+      return Array.from(m[1]!.matchAll(/\(\s*"([^"]+)",\s*"[^"]+",?\s*\)/g), (hit) => hit[1]!);
     };
-    const joined = ASK_STORES.map((s) => s.paths).join(" ");
-    for (const rel of extractStrings("ASK_FILES")) {
-      expect(joined, `ASK_FILES: ~/${rel}`).toContain(`~/${rel}`);
+    const joinedLower = ASK_STORES.map((s) => s.paths).join(" ").toLowerCase();
+    const askFiles = extractFirstTupleStrings("ASK_FILES");
+    expect(askFiles.length).toBeGreaterThanOrEqual(20);
+    for (const rel of askFiles) {
+      expect(joinedLower, `ASK_FILES: ~/${rel}`).toContain(`~/${rel.toLowerCase()}`);
     }
-    for (const tree of extractStrings("ASK_TREES")) {
-      expect(joined, `ASK_TREES: ~/${tree}/`).toContain(`~/${tree}/`);
+    const askTrees = extractFirstTupleStrings("ASK_TREES");
+    expect(askTrees.length).toBeGreaterThanOrEqual(3);
+    for (const tree of askTrees) {
+      expect(joinedLower, `ASK_TREES: ~/${tree}/`).toContain(`~/${tree.toLowerCase()}/`);
     }
-    const prefixBlock = /const ASK_NAME_PREFIXES:[^=]*=\s*&\[([\s\S]*?)\];/.exec(denyRs);
-    if (!prefixBlock) throw new Error("ASK_NAME_PREFIXES not found in deny.rs");
-    for (const pair of prefixBlock[1]!.matchAll(/\("([^"]+)",\s*"([^"]+)"\)/g)) {
-      const entry = `~/${pair[1]}/${pair[2]}*`;
-      expect(joined, `ASK_NAME_PREFIXES: ${entry}`).toContain(entry);
-    }
-    // Rev 4 / P2 CR-17 stores.
-    for (const cr17 of [
-      "~/.gem/credentials",
-      "~/.terraform.d/credentials.tfrc.json",
-      "~/.config/op/config",
-      "~/.yarnrc.yml",
-    ]) {
-      expect(joined, `CR-17: ${cr17}`).toContain(cr17);
+    const prefixBlock = /const ASK_NAME_PREFIXES:[^=]*=\s*&\[([\s\S]*?)\];/.exec(sensitiveRs);
+    if (!prefixBlock) throw new Error("ASK_NAME_PREFIXES not found in v4/paths/sensitive.rs");
+    const prefixes = Array.from(prefixBlock[1]!.matchAll(/\(\s*"([^"]+)",\s*"([^"]+)",\s*"[^"]+",?\s*\)/g));
+    expect(prefixes.length).toBeGreaterThanOrEqual(1);
+    for (const triple of prefixes) {
+      const entry = `~/${triple[1]}/${triple[2]}*`;
+      expect(joinedLower, `ASK_NAME_PREFIXES: ${entry}`).toContain(entry.toLowerCase());
     }
   });
 

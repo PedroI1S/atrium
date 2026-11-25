@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{ApprovalLedger, PolicyEngine, RequestStore};
 
+#[cfg(test)]
 mod deny;
 mod engine;
 mod gate;
