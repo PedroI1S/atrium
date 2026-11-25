@@ -16,9 +16,9 @@ use crate::policy::limits;
 use crate::policy::model::{
     AccessMode, ByteProvenance, Cap, CapReached, CodeExecution, CommandUnit, ComputeBudget,
     DerivedDestinations, ExhaustReason, Exhausted, FilterDialect, FoldRules, FsCap, FsCaps,
-    FsIoError, GapScope, HitMatch, HitSource, LinkPolicy, ModelRedirect, OperandRole, PartId,
-    PartOutcome, PartResult, PipelineId, ProtectedSet, ResolveError, SearchFilter, Separator,
-    TargetOrigin, TargetResolution, ToolEffects, UnitIndex, UnreadReason, Word,
+    FsIoError, GapScope, HitMatch, HitSource, IdentityGap, LinkPolicy, ModelRedirect, OperandRole,
+    PartId, PartOutcome, PartResult, PipelineId, ProtectedSet, ResolveError, SearchFilter,
+    Separator, TargetOrigin, TargetResolution, ToolEffects, UnitIndex, UnreadReason, Word,
 };
 use crate::policy::v4::paths::resolver::fake::FakeFs;
 use crate::policy::v4::paths::sensitive::{
@@ -7573,18 +7573,48 @@ fn round12_hard_deny_target_suppresses_incomplete_alias_table_unread() {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
+fn expected_dir_stream_alloc(dir: &std::path::Path) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = dir;
+        crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let blk = usize::try_from(std::fs::metadata(dir).expect("stat dir").blksize())
+            .expect("non-negative blksize");
+        crate::policy::v4::paths::resolver::dir_stream_alloc_for_blksize(blk)
+    }
+}
+
+#[cfg(unix)]
+const fn expected_dir_entry_peak_headroom() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        0
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        crate::policy::v4::paths::resolver::NAME_ALLOC_PEAK
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     use std::os::unix::ffi::OsStrExt;
 
     use crate::policy::model::{DirEntry, FileType};
-    use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
 
-    // Review 10, finding 1 (§8): `FsResolver::read_dir` charges
-    // `DIR_STREAM_ALLOC` before constructing the directory stream on both
-    // macOS (`fcntl_dupfd_cloexec` + `Dir::new`, with no second open) and
-    // Linux (`RawDir`), so both platforms consume the exact same allocation
-    // budget and a single `DirOpens` cap unit per listing.
+    // Review 10, finding 1 & review 11, finding 1 (§8): `FsResolver::read_dir`
+    // charges `DIR_STREAM_ALLOC` (or `st_blksize + DIR_STREAM_OVERHEAD` when
+    // larger on non-Linux Unix) before constructing the directory stream on
+    // both macOS (`Dir::new(dir_fd)`, single open, no dup) and Linux (`RawDir`),
+    // and checks `NAME_ALLOC_PEAK` headroom before each `dir.next()` on
+    // non-Linux Unix. Total deducted bytes for ordinary directories
+    // (`st_blksize <= 4,096`) match identically across Linux and non-Linux Unix,
+    // with a single `DirOpens` cap unit per listing.
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
     let tiny = root.join("tiny");
@@ -7597,6 +7627,9 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     let tiny_bytes = tiny.as_os_str().as_bytes();
     let empty_bytes = empty.as_os_str().as_bytes();
     let resolver = FsResolver::new();
+    let stream_tiny = expected_dir_stream_alloc(&tiny);
+    let stream_empty = expected_dir_stream_alloc(&empty);
+    let peak = expected_dir_entry_peak_headroom();
 
     // `push_entry_charged` allocates the initial 8-slot `Vec<DirEntry>` buffer
     // once for 1..=8 entries plus each entry's name bytes; `charge_path_conversion`
@@ -7607,11 +7640,16 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
         0
     };
     let entries_bytes = path_conv_tiny + 8 * std::mem::size_of::<DirEntry>() + 1 + 2;
+    let tiny_exact_need = entries_bytes + stream_tiny + peak;
 
-    // 1. Allocation budgets of `entries_bytes` and
-    //    `entries_bytes + DIR_STREAM_ALLOC - 1` must both exhaust before
-    //    completing; `entries_bytes + DIR_STREAM_ALLOC` succeeds with 0 left.
-    for tight in [entries_bytes, entries_bytes + DIR_STREAM_ALLOC - 1] {
+    // 1. Allocation budgets below `entries_bytes + stream_tiny + peak` must
+    //    exhaust `AllocationBudget`; `tiny_exact_need` succeeds with `peak`
+    //    bytes remaining (total deducted == `entries_bytes + stream_tiny`).
+    for tight in [
+        entries_bytes,
+        entries_bytes + stream_tiny - 1,
+        tiny_exact_need - 1,
+    ] {
         let mut budget = ComputeBudget::new(1_000_000, tight);
         assert_eq!(
             resolver.read_dir(tiny_bytes, &mut FsCaps::with_default_limits(), &mut budget),
@@ -7622,11 +7660,15 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
         );
     }
 
-    let mut exact = ComputeBudget::new(1_000_000, entries_bytes + DIR_STREAM_ALLOC);
+    let mut exact = ComputeBudget::new(1_000_000, tiny_exact_need);
     let mut entries = resolver
         .read_dir(tiny_bytes, &mut FsCaps::with_default_limits(), &mut exact)
-        .expect("exact entries_bytes + DIR_STREAM_ALLOC budget must succeed");
-    assert_eq!(exact.remaining_alloc_bytes(), 0);
+        .expect("exact tiny_exact_need budget must succeed");
+    assert_eq!(exact.remaining_alloc_bytes(), peak);
+    assert_eq!(
+        tiny_exact_need - exact.remaining_alloc_bytes(),
+        entries_bytes + stream_tiny
+    );
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(
         entries,
@@ -7643,9 +7685,9 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     );
 
     // 2. Cross-platform total-charge parity check: total deducted bytes match
-    //    the platform-independent formula `entries_bytes + DIR_STREAM_ALLOC`
-    //    on both Linux and macOS, and an empty directory costs exactly
-    //    `path_conv_empty + DIR_STREAM_ALLOC`.
+    //    `entries_bytes + stream_tiny` (which equals `entries_bytes +
+    //    DIR_STREAM_ALLOC` on local `st_blksize <= 4,096` volumes), and an
+    //    empty directory deducts `path_conv_empty + stream_empty`.
     let start_alloc = 1_000_000usize;
     let mut parity_budget = ComputeBudget::new(1_000_000, start_alloc);
     let parity_entries = resolver
@@ -7658,7 +7700,7 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     assert_eq!(parity_entries.len(), 2);
     assert_eq!(
         start_alloc - parity_budget.remaining_alloc_bytes(),
-        entries_bytes + DIR_STREAM_ALLOC
+        entries_bytes + stream_tiny
     );
 
     let path_conv_empty = if empty_bytes.len() >= 256 {
@@ -7666,7 +7708,8 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
     } else {
         0
     };
-    let mut empty_below = ComputeBudget::new(1_000_000, path_conv_empty + DIR_STREAM_ALLOC - 1);
+    let empty_exact_need = path_conv_empty + stream_empty + peak;
+    let mut empty_below = ComputeBudget::new(1_000_000, empty_exact_need - 1);
     assert_eq!(
         resolver.read_dir(
             empty_bytes,
@@ -7677,7 +7720,7 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
             reason: ExhaustReason::AllocationBudget
         }))
     );
-    let mut empty_exact = ComputeBudget::new(1_000_000, path_conv_empty + DIR_STREAM_ALLOC);
+    let mut empty_exact = ComputeBudget::new(1_000_000, empty_exact_need);
     assert_eq!(
         resolver.read_dir(
             empty_bytes,
@@ -7686,7 +7729,11 @@ fn round13_read_dir_charges_dir_stream_alloc_and_single_dir_open() {
         ),
         Ok(Vec::new())
     );
-    assert_eq!(empty_exact.remaining_alloc_bytes(), 0);
+    assert_eq!(empty_exact.remaining_alloc_bytes(), peak);
+    assert_eq!(
+        empty_exact_need - empty_exact.remaining_alloc_bytes(),
+        path_conv_empty + stream_empty
+    );
 
     // 3. `DirOpens` cap at 1: one listing succeeds (no second open from
     //    `Dir::read_from`, zero `LinkReads` or `Canonicalizations` consumed),
@@ -8538,4 +8585,777 @@ fn round13_ancestor_stats_cache_bound_and_hit_miss_parity() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 16. Rework Round 14 regressions (review round 11)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn round14_read_dir_255_byte_name_peak_budget_and_cross_platform_parity() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::policy::model::{DirEntry, FileType};
+    use crate::policy::v4::paths::resolver::DIR_STREAM_ALLOC;
+
+    // Review 11, finding 1 (§8): a directory with a single 255-byte name must
+    // exhaust `AllocationBudget` BEFORE `dir.next()` can allocate a transient
+    // `CString` on non-Linux Unix (`NAME_ALLOC_PEAK` peak check), succeed at
+    // the exact need, and deduct the exact same total allocation bytes as
+    // Linux on ordinary local volumes (`st_blksize <= 4,096`).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let dir = root.join("long_name_dir");
+    std::fs::create_dir(&dir).unwrap();
+    let long_name = "a".repeat(255);
+    assert_eq!(long_name.len(), 255);
+    std::fs::write(dir.join(&long_name), b"x").unwrap();
+
+    let dir_bytes = dir.as_os_str().as_bytes();
+    let resolver = FsResolver::new();
+    let path_conv = if dir_bytes.len() >= 256 {
+        dir_bytes.len() + 1
+    } else {
+        0
+    };
+    let stream_alloc = expected_dir_stream_alloc(&dir);
+    let entries_bytes = 8 * std::mem::size_of::<DirEntry>() + long_name.len();
+    let total_deducted = path_conv + stream_alloc + entries_bytes;
+    let peak = expected_dir_entry_peak_headroom();
+    let exact_need = total_deducted + peak;
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use crate::policy::v4::paths::resolver::{
+            DIR_STREAM_OVERHEAD, NAME_ALLOC_PEAK, dir_stream_alloc_for_blksize,
+        };
+
+        // Pin `st_blksize` stream sizing formula (including large network /
+        // FUSE block sizes and overflow saturation).
+        assert_eq!(dir_stream_alloc_for_blksize(0), DIR_STREAM_ALLOC);
+        assert_eq!(dir_stream_alloc_for_blksize(1_024), DIR_STREAM_ALLOC);
+        assert_eq!(dir_stream_alloc_for_blksize(4_096), DIR_STREAM_ALLOC);
+        assert_eq!(
+            dir_stream_alloc_for_blksize(65_536),
+            65_536 + DIR_STREAM_OVERHEAD
+        );
+        assert_eq!(
+            dir_stream_alloc_for_blksize(1_048_576),
+            1_048_576 + DIR_STREAM_OVERHEAD
+        );
+        assert_eq!(dir_stream_alloc_for_blksize(usize::MAX), usize::MAX);
+
+        // Non-Linux Unix tight budgets:
+        // - `path_conv + stream_alloc` (equals `DIR_STREAM_ALLOC` on local 4K
+        //   volumes with short paths): Exhausted before 1st `dir.next()`;
+        // - `path_conv + stream_alloc + NAME_ALLOC_PEAK - 1`: Exhausted before
+        //   1st `dir.next()`;
+        // - `total_deducted`: Exhausted (no headroom for trailing `dir.next()`);
+        // - `exact_need - 1`: Exhausted 1 byte short of exact need.
+        for tight in [
+            path_conv + stream_alloc,
+            path_conv + stream_alloc + NAME_ALLOC_PEAK - 1,
+            total_deducted,
+            exact_need - 1,
+        ] {
+            let mut b = ComputeBudget::new(1_000_000, tight);
+            assert_eq!(
+                resolver.read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut b),
+                Err(ResolveError::Exhausted(Exhausted {
+                    reason: ExhaustReason::AllocationBudget
+                })),
+                "non-Linux Unix budget {tight} must exhaust AllocationBudget"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux `RawDir` uses a stack buffer with no per-entry `CString`, so
+        // `peak == 0` and exact need is `total_deducted`.
+        assert_eq!(stream_alloc, DIR_STREAM_ALLOC);
+        for tight in [path_conv + DIR_STREAM_ALLOC, exact_need - 1] {
+            let mut b = ComputeBudget::new(1_000_000, tight);
+            assert_eq!(
+                resolver.read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut b),
+                Err(ResolveError::Exhausted(Exhausted {
+                    reason: ExhaustReason::AllocationBudget
+                })),
+                "Linux budget {tight} must exhaust AllocationBudget"
+            );
+        }
+    }
+
+    // Exact need succeeds on both Linux and non-Linux Unix and leaves `peak`
+    // bytes unspent, so total deducted bytes match identically on ordinary
+    // volumes (`st_blksize <= 4,096`).
+    let mut exact = ComputeBudget::new(1_000_000, exact_need);
+    let entries = resolver
+        .read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut exact)
+        .expect("exact need budget must succeed");
+    assert_eq!(exact.remaining_alloc_bytes(), peak);
+    assert_eq!(exact_need - exact.remaining_alloc_bytes(), total_deducted);
+    assert_eq!(
+        entries,
+        vec![DirEntry {
+            name: long_name.as_bytes().to_vec(),
+            file_type: FileType::File,
+        }]
+    );
+
+    // Cross-platform total-deduction parity on a generous budget.
+    let start_alloc = 1_000_000usize;
+    let mut parity = ComputeBudget::new(1_000_000, start_alloc);
+    let got = resolver
+        .read_dir(dir_bytes, &mut FsCaps::with_default_limits(), &mut parity)
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        start_alloc - parity.remaining_alloc_bytes(),
+        total_deducted,
+        "total deducted allocation bytes must match platform-independent formula"
+    );
+}
+
+#[cfg(unix)]
+fn count_open_fds_for_dir(target_dir: &std::path::Path) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let target_md = std::fs::metadata(target_dir).expect("stat target dir");
+        let target_dev = target_md.dev();
+        let target_ino = target_md.ino();
+        let rd = std::fs::read_dir("/proc/self/fd")
+            .expect("expected /proc/self/fd to be readable on Linux");
+        let paths: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        let mut count = 0usize;
+        for fd_path in paths {
+            // Other test threads may close unrelated fds concurrently.
+            if let Ok(md) = std::fs::metadata(&fd_path)
+                && md.is_dir()
+                && md.dev() == target_dev
+                && md.ino() == target_ino
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use rustix::fs::{FileType as RFileType, Mode, OFlags, fstat, open, stat};
+        let target_st = stat(target_dir).expect("stat target dir");
+        let rd = std::fs::read_dir("/dev/fd")
+            .expect("expected /dev/fd to be readable on non-Linux Unix");
+        // Collect fd names and close our `/dev/fd` stream before probing entries.
+        let names: Vec<std::ffi::OsString> = rd.flatten().map(|e| e.file_name()).collect();
+        let mut count = 0usize;
+        for name in names {
+            let Some(s) = name.to_str() else { continue };
+            let Ok(num) = s.parse::<u32>() else { continue };
+            if num <= 2 {
+                continue;
+            }
+            let fd_path = format!("/dev/fd/{num}");
+            if let Ok(dup_fd) = open(
+                fd_path.as_str(),
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) && let Ok(st) = fstat(&dup_fd)
+                && RFileType::from_raw_mode(st.st_mode) == RFileType::Directory
+                && st.st_dev == target_st.st_dev
+                && st.st_ino == target_st.st_ino
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn round14_read_dir_open_fd_count_before_during_and_after() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use rustix::fs::{Mode, OFlags, open};
+
+    use crate::policy::v4::paths::resolver::read_dir_unix_with_hooks;
+
+    // Review 11, test gap 2: count open fds pointing to our unique tempdir
+    // directory before, during, and after a real `FsResolver::read_dir`
+    // listing, proving only 1 fd is held during iteration (so a second open or
+    // extra dup would immediately show as 2) and 0 leak afterwards.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let dir = root.join("fd_count_dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("alpha"), b"1").unwrap();
+    std::fs::write(dir.join("beta"), b"2").unwrap();
+
+    // 1. Self-check the fd counter: 0 closed, 1 open, 2 opens (a second open
+    //    shows clearly), 0 after dropping both.
+    assert_eq!(count_open_fds_for_dir(&dir), 0);
+    let probe1 = open(
+        &dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    assert_eq!(count_open_fds_for_dir(&dir), 1);
+    let probe2 = open(
+        &dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    assert_eq!(count_open_fds_for_dir(&dir), 2);
+    drop(probe2);
+    drop(probe1);
+    assert_eq!(count_open_fds_for_dir(&dir), 0);
+
+    // 2. Real listing: 0 before, 1 on every iteration during, 0 after.
+    let dir_bytes = dir.as_os_str().as_bytes();
+    let before = count_open_fds_for_dir(&dir);
+    assert_eq!(before, 0);
+
+    let mut during = Vec::new();
+    let mut entries = read_dir_unix_with_hooks(
+        dir_bytes,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+        || {},
+        || during.push(count_open_fds_for_dir(&dir)),
+    )
+    .expect("read_dir succeeds");
+    let after = count_open_fds_for_dir(&dir);
+
+    assert_eq!(after, 0);
+    assert!(
+        during.len() >= 3,
+        "expected at least 2 entry reads plus EOF probe, got {during:?}"
+    );
+    assert!(
+        during.iter().all(|&c| c == 1),
+        "expected exactly 1 open fd during listing (no second open or dup), got {during:?}"
+    );
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, b"alpha");
+    assert_eq!(entries[1].name, b"beta");
+
+    // 3. Early failure mid-listing (`EntriesRead` cap = 1) must not leak an fd.
+    let err = read_dir_unix_with_hooks(
+        dir_bytes,
+        &mut FsCaps::new(1, 10, 10, 10, 10),
+        &mut ComputeBudget::with_default_limits(),
+        || {},
+        || {},
+    );
+    assert_eq!(
+        err,
+        Err(ResolveError::CapReached(CapReached {
+            cap: FsCap::EntriesRead
+        }))
+    );
+    assert_eq!(count_open_fds_for_dir(&dir), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn round14_removed_dir_between_open_and_read_preserves_verdict() {
+    use std::cell::Cell;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    use crate::policy::model::{DirEntry, PathMetadata};
+    use crate::policy::v4::paths::resolver::read_dir_unix_with_hooks;
+
+    // Review 11, test gap 3 (contract §2 "Time", §5): removing an empty
+    // directory between `open` and reading must yield either an empty listing
+    // (Linux `RawDir` and macOS APFS `fdopendir`+`readdir`) or `NotFound`
+    // (pre-round-13 `Dir::read_from`'s `openat(fd, ".")` on an unlinked dir),
+    // never `ResolveError::Io(_)`. Above all, `check_recursive_root` (and
+    // `expand_shell_glob`) must produce the exact same verdict under all three
+    // behaviours.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_home = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let home_bytes = fake_home.as_os_str().as_bytes().to_vec();
+
+    // 1. Direct real-FS `read_dir` with `rmdir` firing right after `open`.
+    let vanish = fake_home.join("vanish_direct");
+    std::fs::create_dir(&vanish).unwrap();
+    let vanish_bytes = vanish.as_os_str().as_bytes().to_vec();
+    let removed_once = Cell::new(false);
+    let direct_res = read_dir_unix_with_hooks(
+        &vanish_bytes,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+        || {
+            if !removed_once.replace(true) {
+                std::fs::remove_dir(&vanish).expect("rmdir empty dir after open");
+            }
+        },
+        || {},
+    );
+    assert!(removed_once.get());
+    assert!(!vanish.exists());
+    assert!(
+        matches!(&direct_res, Ok(v) if v.is_empty())
+            || matches!(&direct_res, Err(ResolveError::NotFound)),
+        "removed-after-open dir must return empty listing or NotFound, never Io: {direct_res:?}"
+    );
+
+    // 2. Wrapper resolver that intercepts `read_dir` on one target dir with
+    //    either (a) empty listing `Ok(vec![])`, (b) `Err(NotFound)` (the
+    //    pre-round-13 `Dir::read_from` outcome), or (c) the real OS
+    //    remove-between-open-and-read path.
+    enum InterceptMode {
+        EmptyListing,
+        NotFound,
+        RealRemoveAfterOpen {
+            path: PathBuf,
+            remove_on_call: usize,
+            calls: Cell<usize>,
+        },
+    }
+    struct InterceptResolver<'a> {
+        inner: &'a dyn PathResolver,
+        target_dir: Vec<u8>,
+        mode: InterceptMode,
+    }
+    impl PathResolver for InterceptResolver<'_> {
+        fn stat(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<PathMetadata, ResolveError> {
+            self.inner.stat(path, caps, budget)
+        }
+        fn lstat(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<PathMetadata, ResolveError> {
+            self.inner.lstat(path, caps, budget)
+        }
+        fn read_link(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<u8>, ResolveError> {
+            self.inner.read_link(path, caps, budget)
+        }
+        fn canonicalize(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<u8>, ResolveError> {
+            self.inner.canonicalize(path, caps, budget)
+        }
+        fn read_dir(
+            &self,
+            path: &[u8],
+            caps: &mut FsCaps,
+            budget: &mut ComputeBudget,
+        ) -> Result<Vec<DirEntry>, ResolveError> {
+            if path == self.target_dir.as_slice() {
+                match &self.mode {
+                    InterceptMode::EmptyListing => {
+                        caps.charge_dir_open()?;
+                        budget.charge(path.len().max(1) as u64)?;
+                        return Ok(Vec::new());
+                    }
+                    InterceptMode::NotFound => {
+                        caps.charge_dir_open()?;
+                        budget.charge(path.len().max(1) as u64)?;
+                        return Err(ResolveError::NotFound);
+                    }
+                    InterceptMode::RealRemoveAfterOpen {
+                        path: dir_path,
+                        remove_on_call,
+                        calls,
+                    } => {
+                        let idx = calls.get();
+                        calls.set(idx + 1);
+                        return read_dir_unix_with_hooks(
+                            path,
+                            caps,
+                            budget,
+                            || {
+                                if idx == *remove_on_call {
+                                    std::fs::remove_dir(dir_path)
+                                        .expect("rmdir empty root after open");
+                                }
+                            },
+                            || {},
+                        );
+                    }
+                }
+            }
+            self.inner.read_dir(path, caps, budget)
+        }
+    }
+
+    let real = FsResolver::new();
+    let follow = LinkPolicy {
+        at_root: true,
+        below_root: true,
+    };
+    let filter_rs = SearchFilter {
+        dialect: FilterDialect::RgGlob,
+        pattern: unquoted(b"*.rs"),
+        case_insensitive: false,
+        argv_index: Some(1),
+    };
+    let filter_msal = SearchFilter {
+        dialect: FilterDialect::SearchGlob,
+        pattern: unquoted(b"msal*"),
+        case_insensitive: false,
+        argv_index: None,
+    };
+
+    // Helper: run `check_recursive_root` under all three modes on a fresh
+    // empty directory under `fake_home` and assert identical `RecursiveRootResult`.
+    let assert_recursive_parity = |rel: &str, filters: &[SearchFilter], remove_on_call: usize| {
+        let dir = fake_home.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_bytes = dir.as_os_str().as_bytes().to_vec();
+        let prot = build_protected_set(
+            &home_bytes,
+            &home_bytes,
+            vec![],
+            vec![],
+            FoldRules::REV4,
+            &real,
+            &mut FsCaps::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+            &mut ComputeBudget::new(u64::MAX, usize::MAX),
+        )
+        .unwrap();
+        let target = resolve_literal(
+            &dir_bytes,
+            &home_bytes,
+            &home_bytes,
+            TargetOrigin::SubjectPath { path_index: 0 },
+            AccessMode::Read,
+            &real,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+
+        let run_mode = |mode: InterceptMode| {
+            let r = InterceptResolver {
+                inner: &real,
+                target_dir: dir_bytes.clone(),
+                mode,
+            };
+            check_recursive_root(
+                &target,
+                follow,
+                filters,
+                &prot,
+                &r,
+                &mut FsCaps::with_default_limits(),
+                &mut ComputeBudget::with_default_limits(),
+            )
+            .unwrap()
+        };
+
+        let empty_verdict = run_mode(InterceptMode::EmptyListing);
+        let not_found_verdict = run_mode(InterceptMode::NotFound);
+        let real_removed_verdict = run_mode(InterceptMode::RealRemoveAfterOpen {
+            path: dir.clone(),
+            remove_on_call,
+            calls: Cell::new(0),
+        });
+        assert!(!dir.exists(), "{rel} must have been removed after open");
+        assert_eq!(
+            empty_verdict, not_found_verdict,
+            "{rel}: empty listing and NotFound must give identical recursive-root verdict"
+        );
+        assert_eq!(
+            real_removed_verdict, not_found_verdict,
+            "{rel}: real removed-after-open verdict must match pre-round-13 NotFound verdict"
+        );
+        real_removed_verdict
+    };
+
+    // 2a. Ordinary recursive root (no filter and with filter): Clear, no Unread.
+    let ord = assert_recursive_parity("proj_plain", &[], 0);
+    assert!(all_clear(&ord.outcomes), "{:?}", ord.outcomes);
+    let ord_filt = assert_recursive_parity("proj_filt", std::slice::from_ref(&filter_rs), 0);
+    assert!(all_clear(&ord_filt.outcomes), "{:?}", ord_filt.outcomes);
+
+    // 2b. Empty `~/.azure` with `msal*` filter: StoreHit (probe + root), no Unread
+    //     (removed during `RootAliases` on call 0, and during the recursive walk on call 1).
+    for remove_on_call in [0usize, 1] {
+        let azure =
+            assert_recursive_parity(".azure", std::slice::from_ref(&filter_msal), remove_on_call);
+        assert!(has_store_hit(&azure.outcomes), "{:?}", azure.outcomes);
+        assert!(!has_any_hard_deny(&azure.outcomes), "{:?}", azure.outcomes);
+        assert!(
+            !has_unread(&azure.outcomes, |_| true),
+            "{:?}",
+            azure.outcomes
+        );
+    }
+
+    // 2c. Empty `~/.ssh` root: StoreHit("ssh-dir"), no HardDenyHit, no Unread
+    //     (removed during `RootAliases::push_ssh_members` on call 0, and during
+    //     S8's `scan_ssh_dir` walk on call 1).
+    for remove_on_call in [0usize, 1] {
+        let ssh = assert_recursive_parity(".ssh", &[], remove_on_call);
+        assert!(has_store_hit(&ssh.outcomes), "{:?}", ssh.outcomes);
+        assert!(!has_any_hard_deny(&ssh.outcomes), "{:?}", ssh.outcomes);
+        assert!(!has_unread(&ssh.outcomes, |_| true), "{:?}", ssh.outcomes);
+    }
+
+    // 3. `expand_shell_glob` on a removed-after-open dir: empty listing and
+    //    NotFound both fall back to the literal word with zero Unreads.
+    let glob_dir = fake_home.join("glob_vanish");
+    std::fs::create_dir(&glob_dir).unwrap();
+    let glob_dir_bytes = glob_dir.as_os_str().as_bytes().to_vec();
+    let pat = unquoted(b"glob_vanish/*");
+    let exp_empty = expand_shell_glob(
+        &pat,
+        &home_bytes,
+        &home_bytes,
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        AccessMode::Read,
+        &InterceptResolver {
+            inner: &real,
+            target_dir: glob_dir_bytes.clone(),
+            mode: InterceptMode::EmptyListing,
+        },
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    let exp_not_found = expand_shell_glob(
+        &pat,
+        &home_bytes,
+        &home_bytes,
+        PartId::Operand {
+            unit: UnitIndex(0),
+            argv_index: 1,
+        },
+        AccessMode::Read,
+        &InterceptResolver {
+            inner: &real,
+            target_dir: glob_dir_bytes,
+            mode: InterceptMode::NotFound,
+        },
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert_eq!(exp_empty, exp_not_found);
+    assert!(exp_empty.unread.is_empty());
+}
+
+#[test]
+fn round14_target_with_any_target_gap_and_incomplete_alias_table_keeps_both_reasons() {
+    // Review 11, test gap 4 (contract §1, §5; `model.rs` `CallOutcome` and
+    // `ProtectedSet::identity_gaps`; D-144): when a target has BOTH an
+    // applicable `AnyTarget` gap (`R1`) in `ProtectedSet::identity_gaps` AND
+    // an incomplete `RootAliases` table with a distinct reason (`R2`), BOTH
+    // reasons for doubt are kept (so neither D-144's gap reason nor the alias
+    // table's reason is silently dropped), while identical reasons (`R1 == R2`)
+    // are deduplicated and a `HardDenyHit` suppresses both.
+    let join_home = |parts: &[&[u8]]| -> Vec<u8> {
+        let mut out = HOME.to_vec();
+        for p in parts {
+            out.push(b'/');
+            out.extend_from_slice(p);
+        }
+        out
+    };
+    let ssh_dir = join_home(&[b".ssh"]);
+    let aws_cred = join_home(&[b".aws", b"credentials"]);
+    let netrc = join_home(&[b".netrc"]);
+    let pypirc = join_home(&[b".pypirc"]);
+    let proj_readme = join_home(&[b"proj", b"readme"]);
+
+    // 1. Distinct reasons: `build_protected_set` records an `AnyTarget` gap
+    //    `R1 = UnresolvablePath("~/.aws/credentials")` (stat PermissionDenied),
+    //    while `RootAliases` hits `Canonicalizations` cap = 1 on `~/.ssh`
+    //    (`R2 = WalkCapReached(FsCap::Canonicalizations)`).
+    let mut fs = FakeFs::new();
+    fs.mkdir_all(&ssh_dir);
+    fs.add_file(&aws_cred);
+    fs.set_stat_error(&aws_cred, FsIoError::PermissionDenied);
+    fs.add_file(&netrc);
+    fs.add_file(&pypirc);
+    fs.add_file(&proj_readme);
+
+    let prot = default_build(&fs);
+    let r1 = UnreadReason::UnresolvablePath {
+        path: aws_cred.clone(),
+    };
+    let r2 = UnreadReason::WalkCapReached(FsCap::Canonicalizations);
+    assert_eq!(
+        prot.identity_gaps,
+        vec![IdentityGap {
+            reason: r1.clone(),
+            scope: GapScope::AnyTarget,
+            write_only: false,
+        }]
+    );
+
+    // Pure `check_target` reports D-144's `AnyTarget` gap reason `R1`.
+    let readme_target = literal(&proj_readme, AccessMode::Read, &fs);
+    assert_eq!(
+        check_target(
+            &readme_target,
+            &prot,
+            &mut ComputeBudget::with_default_limits()
+        )
+        .unwrap()
+        .outcome,
+        PartOutcome::Unread(r1.clone())
+    );
+
+    // Subject flow on ordinary target `proj/readme`: keeps BOTH `R1` and `R2`.
+    let subj = resolve_subject_paths(
+        &["proj/readme".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!has_any_hard_deny(&subj.outcomes), "{:?}", subj.outcomes);
+    assert!(
+        has_unread(&subj.outcomes, |r| r == &r1),
+        "must retain D-144 AnyTarget gap reason R1: {:?}",
+        subj.outcomes
+    );
+    assert!(
+        has_unread(&subj.outcomes, |r| r == &r2),
+        "must retain incomplete alias table reason R2: {:?}",
+        subj.outcomes
+    );
+
+    // Store target `.pypirc`: keeps StoreHit AND both `R1` and `R2`.
+    let store = resolve_subject_paths(
+        &[".pypirc".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_store_hit(&store.outcomes), "{:?}", store.outcomes);
+    assert!(
+        has_unread(&store.outcomes, |r| r == &r1),
+        "{:?}",
+        store.outcomes
+    );
+    assert!(
+        has_unread(&store.outcomes, |r| r == &r2),
+        "{:?}",
+        store.outcomes
+    );
+
+    // Hard-deny target `.netrc`: HardDenyHit suppresses both `R1` and `R2`.
+    let hard = resolve_subject_paths(
+        &[".netrc".to_string()],
+        None,
+        false,
+        AccessMode::Read,
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(has_hard_deny(&hard.outcomes, "credential-read"));
+    assert!(!has_unread(&hard.outcomes, |_| true), "{:?}", hard.outcomes);
+
+    // Command flow (`cat proj/readme`): keeps BOTH `R1` and `R2`.
+    let cmd = resolve_command_targets(
+        &[unit(
+            0,
+            vec![unquoted(b"cat"), unquoted(b"proj/readme")],
+            vec![],
+            Separator::Start,
+            None,
+        )],
+        &[reader_effects("cat", 2)],
+        HOME,
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 1),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_unread(&cmd.outcomes, |r| r == &r1),
+        "{:?}",
+        cmd.outcomes
+    );
+    assert!(
+        has_unread(&cmd.outcomes, |r| r == &r2),
+        "{:?}",
+        cmd.outcomes
+    );
+
+    // Recursive root (`proj`): keeps BOTH `R1` and `R2`.
+    let rec = check_recursive_root(
+        &literal(b"proj", AccessMode::Read, &fs),
+        LinkPolicy::default(),
+        &[],
+        &prot,
+        &fs,
+        &mut FsCaps::new(1000, 1000, 1000, 1000, 0),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_unread(&rec.outcomes, |r| r == &r1),
+        "{:?}",
+        rec.outcomes
+    );
+    assert!(
+        has_unread(&rec.outcomes, |r| r == &r2),
+        "{:?}",
+        rec.outcomes
+    );
+
+    // 2. Identical reasons (`R1 == R2`): unlistable `~/.ssh` produces the same
+    //    reason in both `ProtectedSet::identity_gaps` and `RootAliases::incomplete`;
+    //    emitted once (deduplicated) rather than duplicated.
+    let mut same_fs = FakeFs::new();
+    same_fs.mkdir_all(&ssh_dir);
+    same_fs.set_dir_read_error(&ssh_dir, FsIoError::PermissionDenied);
+    same_fs.add_file(&proj_readme);
+    let same_prot = default_build(&same_fs);
+    let same_res = subject("proj/readme", AccessMode::Read, &same_prot, &same_fs);
+    let same_unreads: Vec<&PartResult> = same_res
+        .outcomes
+        .iter()
+        .filter(|r| matches!(r.outcome, PartOutcome::Unread(_)))
+        .collect();
+    assert_eq!(
+        same_unreads,
+        vec![&PartResult {
+            part: PartId::SubjectPath { path_index: 0 },
+            outcome: PartOutcome::Unread(UnreadReason::UnresolvablePath { path: ssh_dir }),
+        }]
+    );
 }
