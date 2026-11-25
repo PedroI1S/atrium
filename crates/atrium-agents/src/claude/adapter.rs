@@ -2483,42 +2483,71 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn withdraw_timeout_bounds_drain_without_shrinking_gate_deadline() {
+        let gate_deadline = Duration::from_secs(73);
+        let override_timeout = Duration::from_secs(11);
+
         let adapter = ClaudeAdapter::new(ClaudeOptions {
-            gate_deadline: Duration::from_secs(60),
+            gate_deadline,
             ..ClaudeOptions::default()
         })
-        .with_withdraw_timeout(Duration::from_millis(20));
-        assert_eq!(adapter.options.gate_deadline, Duration::from_secs(60));
-        assert_eq!(adapter.withdraw_timeout, Some(Duration::from_millis(20)));
+        .with_withdraw_timeout(override_timeout);
+        assert_eq!(adapter.options.gate_deadline, gate_deadline);
+        assert_eq!(adapter.withdraw_timeout, Some(override_timeout));
 
-        // 1. With an explicit `withdraw_timeout`, `drain_withdrawals` detaches
-        //    after `withdraw_timeout` (20 ms) rather than `gate_deadline` (60 s).
+        // 1. With an explicit `withdraw_timeout`, `drain_withdrawals` stays
+        //    pending before `override_timeout` (11 s) and detaches at exact
+        //    `override_timeout` rather than `gate_deadline` (73 s).
         let started = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let mut a = actor("withdraw-timeout", &[init_line()]);
-        a.options.gate_deadline = Duration::from_secs(60);
-        a.withdraw_timeout = Some(Duration::from_millis(20));
+        a.options.gate_deadline = gate_deadline;
+        a.withdraw_timeout = Some(override_timeout);
         a.gate = Arc::new(BlockingWithdrawGate {
             started: started.clone(),
             release: release_rx,
         });
         a.queue_withdraw(ApprovalTicket::new("W1".into(), false), None);
 
-        timeout(Duration::from_secs(2), a.drain_withdrawals())
-            .await
-            .expect("drain_withdrawals did not honor withdraw_timeout");
+        let start = TokioInstant::now();
+        {
+            let mut drain = Box::pin(a.drain_withdrawals());
+            tokio::select! {
+                biased;
+                _ = &mut drain => panic!("drain_withdrawals detached immediately"),
+                _ = std::future::ready(()) => {}
+            }
+            tokio::time::advance(override_timeout - Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = &mut drain => panic!("drain_withdrawals detached before withdraw_timeout"),
+                _ = std::future::ready(()) => {}
+            }
+            assert_eq!(started.load(Ordering::Acquire), 1);
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = &mut drain => {}
+                _ = std::future::ready(()) => {
+                    panic!("drain_withdrawals did not detach at withdraw_timeout")
+                }
+            }
+        }
+        assert_eq!(start.elapsed(), override_timeout);
         assert!(a.pending_withdrawals.is_empty());
         assert_eq!(started.load(Ordering::Acquire), 1);
         let _ = release_tx.send(true);
 
         // 2. With no override (`withdraw_timeout = None`), `drain_withdrawals`
-        //    falls back to `options.gate_deadline` and detaches at ~20 ms.
+        //    falls back to `options.gate_deadline`, stays pending past
+        //    `override_timeout` all the way to `gate_deadline - 1 s`, and
+        //    detaches at exact `gate_deadline` (73 s).
         let started_fb = Arc::new(AtomicUsize::new(0));
         let (release_fb_tx, release_fb_rx) = tokio::sync::watch::channel(false);
         let mut b = actor("withdraw-timeout-fallback", &[init_line()]);
-        b.options.gate_deadline = Duration::from_millis(20);
+        b.options.gate_deadline = gate_deadline;
         b.withdraw_timeout = None;
         b.gate = Arc::new(BlockingWithdrawGate {
             started: started_fb.clone(),
@@ -2526,19 +2555,34 @@ mod tests {
         });
         b.queue_withdraw(ApprovalTicket::new("W2".into(), false), None);
 
-        let t0 = Instant::now();
-        timeout(Duration::from_secs(2), b.drain_withdrawals())
-            .await
-            .expect("drain_withdrawals did not fall back to gate_deadline");
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(15),
-            "fallback detached too early ({elapsed:?}); expected ~20 ms gate_deadline"
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "fallback stayed blocked too long ({elapsed:?}); expected ~20 ms gate_deadline"
-        );
+        let start_fb = TokioInstant::now();
+        {
+            let mut drain_fb = Box::pin(b.drain_withdrawals());
+            tokio::select! {
+                biased;
+                _ = &mut drain_fb => panic!("fallback drain_withdrawals detached immediately"),
+                _ = std::future::ready(()) => {}
+            }
+            tokio::time::advance(gate_deadline - Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = &mut drain_fb => {
+                    panic!("fallback drain_withdrawals detached before gate_deadline")
+                }
+                _ = std::future::ready(()) => {}
+            }
+            assert_eq!(started_fb.load(Ordering::Acquire), 1);
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = &mut drain_fb => {}
+                _ = std::future::ready(()) => {
+                    panic!("fallback drain_withdrawals did not detach at gate_deadline")
+                }
+            }
+        }
+        assert_eq!(start_fb.elapsed(), gate_deadline);
         assert!(b.pending_withdrawals.is_empty());
         assert_eq!(started_fb.load(Ordering::Acquire), 1);
         let _ = release_fb_tx.send(true);
@@ -2701,7 +2745,7 @@ for line in sys.stdin:
     /// - hold the in-flight slot and permit while the late ticket call is running,
     /// - withdraw the late ticket (`L1`) exactly once via `OrphanGuard::drop`,
     /// - hold the permit until that withdrawal finishes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn late_question_ticket_denies_without_event_and_withdraws_orphan() {
         struct LateQuestionGate {
             ticket_entered: tokio::sync::watch::Sender<bool>,

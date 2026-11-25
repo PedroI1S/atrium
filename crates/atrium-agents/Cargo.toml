@@ -24,3 +24,4 @@ workspace = true
 sha2 = "0.10" # M1-12
 atrium-core.workspace = true # M1-07 (policy end-to-end tests; a dev-dependency cycle is fine)
 globset = "0.4" # M1-07 (the exhaustive glob test matches as the policy does)
+tokio = { workspace = true, features = ["test-util"] } # M1-44 (paused tokio clock in unit tests)
