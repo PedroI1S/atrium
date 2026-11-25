@@ -1029,6 +1029,18 @@ fn exec_unit_sequence(
             };
         }
 
+        // `eval`, `source` and `.` run their code in this shell, so they may
+        // run a `cd` the model can't see: the cwd of the later units in this
+        // scope is unknown (§5, "any other `cd`"; P5 review 1, finding 4,
+        // changed in P5 under D-176 item 4). Every other code runner, nested
+        // shells included, runs in a child process and can't move this
+        // shell's cwd.
+        if let Some(e) = eff
+            && matches!(e.tool_name, Some("eval" | "source" | "."))
+        {
+            cwd_state = CwdState::Unknown;
+        }
+
         // Record possible-writer status for later units.
         if let Some(w) = ctx.subtree_writers[idx] {
             if unit.pipeline_id.is_some() {
