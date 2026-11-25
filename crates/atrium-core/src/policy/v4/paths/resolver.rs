@@ -182,13 +182,22 @@ pub(super) const DIR_STREAM_OVERHEAD: usize = 256;
 /// before building a directory stream in [`FsResolver::read_dir`] (§2, §8;
 /// review 10, finding 1; review 11, finding 1; review 12, finding 1).
 ///
+/// Equals [`DIR_STREAM_OVERHEAD`] (256 bytes), matching
+/// [`FALLBACK_CANON_OVERHEAD`] for `canonicalize`: the stream's transient read
+/// buffer (`dd_buf` on non-Linux Unix, freed by `closedir` when `Dir` drops;
+/// stack buffer on Linux `RawDir`) is **never** permanently deducted, because
+/// deducting 4 KiB+ per listing burns > 4.25 MiB across `FS_MAX_DIR_OPENS`
+/// (1,024) and exhausts the 8 MiB `COMPUTE_BUDGET_ALLOC_BYTES` before
+/// `FsCap::DirOpens` when paired with `FS_MAX_CANONICALIZATIONS` (4,096)
+/// operands.
+///
 /// Per-platform behaviour:
 /// - **Linux:** `rustix::fs::RawDir` reads into a fixed 4,096-byte stack buffer
 ///   and makes no heap allocation for the stream or for individual entries
 ///   before [`push_unix_dir_entry`] (it borrows `&CStr` directly from the stack
 ///   buffer and charges name compute before copying into `Vec<u8>`). Deducting
-///   `DIR_STREAM_ALLOC` (4,352 bytes) keeps every listing's permanent
-///   allocation total identical to non-Linux Unix.
+///   `DIR_STREAM_ALLOC` (256 bytes) keeps every listing's permanent allocation
+///   total identical to non-Linux Unix.
 /// - **Non-Linux Unix (macOS / BSD):** `rustix::fs::Dir::new` calls `fdopendir`,
 ///   whose libc `dd_buf` is freed when the listing ends and can follow the
 ///   directory's `st_blksize` (4,096 bytes on local APFS/HFS+, potentially
@@ -198,25 +207,30 @@ pub(super) const DIR_STREAM_OVERHEAD: usize = 256;
 ///   (`> DIR_STREAM_MAX_BLKSIZE`) block sizes as
 ///   `ResolveError::Io(FsIoError::Other)` (`Unread`), verifies without
 ///   permanently deducting that `budget.remaining_alloc_bytes()` covers the
-///   real transient peak (`max(st_blksize, DIR_STREAM_PEAK_FLOOR) +
+///   full transient peak (`max(st_blksize, DIR_STREAM_PEAK_FLOOR) +
 ///   DIR_STREAM_OVERHEAD`), and permanently deducts only `DIR_STREAM_ALLOC`
-///   (4,352 bytes), so totals match Linux on every volume. While the `Dir`
-///   stream remains open, the un-deducted transient headroom
-///   (`peak - DIR_STREAM_ALLOC`) is preserved across both retained pushes and
-///   each `dir.next()` call. Because `rustix`'s libc-backend `Dir::next` also
-///   allocates and copies a transient `CString` per entry, each iteration
-///   verifies both allocation headroom (`stream_extra + NAME_ALLOC_PEAK`) and
-///   compute headroom (`NAME_COMPUTE_PEAK`) before advancing `dir.next()`, and
-///   charges `name.len() - 1` compute before copying the name into the stack
+///   (256 bytes), so totals match Linux on every volume. While the `Dir` stream
+///   remains open, the full un-deducted transient buffer headroom
+///   (`peak - DIR_STREAM_ALLOC = max(st_blksize, DIR_STREAM_PEAK_FLOOR)`) is
+///   preserved across both retained pushes and each `dir.next()` call. Because
+///   `rustix`'s libc-backend `Dir::next` also allocates and copies a transient
+///   `CString` per entry, each iteration verifies both allocation headroom
+///   (`stream_extra + NAME_ALLOC_PEAK`) and compute headroom
+///   (`NAME_COMPUTE_PEAK`) before advancing `dir.next()`, and charges
+///   `name.len() - 1` compute before copying the name into the stack
 ///   `name_buf`.
-/// - **Non-Unix:** charged before `std::fs::read_dir`, alongside the per-entry
-///   `PATH_MAX` charge before each `next()`.
+/// - **Non-Unix:** verifies `4_096 + DIR_STREAM_OVERHEAD` transient peak
+///   headroom and deducts `DIR_STREAM_ALLOC` (256 bytes) before
+///   `std::fs::read_dir`, alongside the per-entry `PATH_MAX` charge before each
+///   `next()`.
 ///
 /// Across the full `FS_MAX_DIR_OPENS` (1,024) cap on any valid volume
-/// (`st_blksize <= DIR_STREAM_MAX_BLKSIZE`), `1,024 * 4,352` (~4.25 MiB) stays
-/// well inside `COMPUTE_BUDGET_ALLOC_BYTES` (8 MiB), so large walks reach
-/// `FsCap::DirOpens` (`Unread`, §2) before exhausting `AllocationBudget`.
-pub(super) const DIR_STREAM_ALLOC: usize = 4_096 + DIR_STREAM_OVERHEAD;
+/// (`st_blksize <= DIR_STREAM_MAX_BLKSIZE`), `1,024 * 256` (256 KiB, 3.1% of
+/// 8 MiB) leaves > 3 MiB of headroom even after 4,096 single-component
+/// operands, comfortably covering even a 1 MiB `st_blksize` transient peak so
+/// large walks reach `FsCap::DirOpens` (`Unread`, §2) before exhausting
+/// `AllocationBudget`.
+pub(super) const DIR_STREAM_ALLOC: usize = DIR_STREAM_OVERHEAD;
 
 /// Minimum assumed transient `dd_buf` size (64 KiB) for the non-Linux Unix
 /// stream peak check before `rustix::fs::Dir::new` (`fdopendir`) (§8;
@@ -296,9 +310,10 @@ pub(super) fn dir_stream_peak_for_blksize(blksize: usize) -> usize {
 /// - Checks without permanently deducting that `budget.remaining_alloc_bytes()`
 ///   covers [`dir_stream_peak_for_blksize`], exhausting `AllocationBudget`
 ///   before `Dir::new` if not.
-/// - Permanently deducts only [`DIR_STREAM_ALLOC`] (4,352 bytes), keeping
-///   totals equal to Linux on every volume.
-/// - Returns the live transient headroom (`peak - DIR_STREAM_ALLOC`) held in
+/// - Permanently deducts only [`DIR_STREAM_ALLOC`] (256 bytes, equal to
+///   [`DIR_STREAM_OVERHEAD`]), keeping totals equal to Linux on every volume.
+/// - Returns the live transient headroom (`peak - DIR_STREAM_ALLOC`, i.e., the
+///   full `dd_buf` bound `max(st_blksize, DIR_STREAM_PEAK_FLOOR)`) held in
 ///   libc's `dd_buf` until the `Dir` stream is dropped.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(super) fn charge_dir_stream(
@@ -890,7 +905,12 @@ impl PathResolver for FsResolver {
             budget.charge(path.len().max(1) as u64)?;
             charge_path_conversion(path, budget)?;
             let p = bytes_to_path(path)?;
+            let stream_peak = 4_096 + DIR_STREAM_OVERHEAD;
+            if budget.remaining_alloc_bytes() < stream_peak {
+                budget.charge_alloc(stream_peak)?;
+            }
             budget.charge_alloc(DIR_STREAM_ALLOC)?;
+            let stream_extra = stream_peak.saturating_sub(DIR_STREAM_ALLOC);
             let mut rd = std::fs::read_dir(p).map_err(|e| map_io_error(&e, false))?;
             let mut out: Vec<DirEntry> = Vec::new();
             loop {
@@ -898,7 +918,7 @@ impl PathResolver for FsResolver {
                 budget.charge(1)?;
                 // `std` allocates the entry (and its name) while advancing,
                 // so the largest name is charged first.
-                budget.charge_alloc(PATH_MAX)?;
+                charge_alloc_with_headroom(budget, PATH_MAX, stream_extra)?;
                 let Some(entry_res) = rd.next() else {
                     break;
                 };
@@ -908,14 +928,14 @@ impl PathResolver for FsResolver {
                 budget.charge(name_bytes.len().saturating_sub(1) as u64)?;
                 charge_aux_stat(name_bytes.len(), caps, budget)?;
                 let ft = entry.file_type().map_err(|e| map_io_error(&e, false))?;
-                budget.charge_alloc(name_bytes.len())?;
+                charge_alloc_with_headroom(budget, name_bytes.len(), stream_extra)?;
                 push_entry_charged(
                     &mut out,
                     DirEntry {
                         name: name_bytes.to_vec(),
                         file_type: map_file_type(ft),
                     },
-                    0,
+                    stream_extra,
                     budget,
                 )?;
             }
