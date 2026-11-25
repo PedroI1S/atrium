@@ -941,6 +941,52 @@ fn section3_amendment_tilde_inside_words_and_bare_dup_redirects() {
     }
 }
 
+/// P5 review 1, finding 2: `dev`'s best-effort readings of decoded code
+/// (contract §2 keeps them) still hard-deny under every preset, full access
+/// included; a line whose decoded text reaches no sink stays a plain call.
+#[test]
+fn round2_finding2_dev_decoded_payloads_hard_deny_under_full_access() {
+    let env = Env::home();
+    for line in [
+        "echo 'rm -rf ~' | at now",
+        "echo 'rm -rf ~' | batch",
+        "yes 'rm -rf ~' | sh",
+        "printf 'rm -rf \\176\\n' | sh",
+        "echo -e 'rm -rf \\x7e' | { :; sh; }",
+        "echo 'rm -rf ~' | while read l; do sh; done",
+        "at now <<EOF\nrm -rf ~\nEOF",
+        "{ bash; } <<EOF\nrm -rf ~\nEOF",
+        "cat <<EOF > >(bash)\nrm -rf ~\nEOF",
+        "env -ZSfoo bash <(echo 'rm -rf ~')",
+        "$(echo rm -rf ~)",
+        "nohup `echo rm -rf ~`",
+        "s$(echo h) -c 'rm -rf ~'",
+        "script -t0 rm -rf ~/",
+        "script --timing=/dev/null rm -rf ~/",
+        "$(which nice) -n 5 $(which env) -S 'rm -rf ~'",
+        "cd .ssh; ls | xargs cat",
+    ] {
+        for preset in [Preset::Home, Preset::FullAccess] {
+            let v = env.eval_check(&cmd_check(line), &[], preset);
+            assert!(
+                matches!(v, PolicyVerdict::HardDeny { .. }),
+                "{line:?} under {preset:?}: {v:?}"
+            );
+        }
+    }
+    for line in [
+        "echo 'rm -rf ~' | cat",
+        "cat <<EOF\nrm -rf ~\nEOF",
+        "echo if then | wc -l",
+    ] {
+        let v = env.eval_check(&cmd_check(line), &[], Preset::FullAccess);
+        assert!(
+            !matches!(v, PolicyVerdict::HardDeny { .. }),
+            "{line:?}: {v:?}"
+        );
+    }
+}
+
 #[test]
 fn home_preset_allows_reads_and_asks_for_changes() {
     let env = Env::home();

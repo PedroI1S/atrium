@@ -30,7 +30,72 @@ use crate::policy::v4::paths::sensitive::{
     under_bytes,
 };
 
+mod dev_readings;
+
 const DOWNLOADERS: &[&str] = &["curl", "wget", "fetch"];
+
+/// How deep `dev`'s decoded payloads are read again (finding 2): a payload's
+/// own payloads are read, theirs are not.
+const MAX_DEV_PAYLOAD_DEPTH: u8 = 2;
+
+std::thread_local! {
+    static DEV_PAYLOAD_DEPTH: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores the payload depth when a nested pass ends, even on `?`.
+struct DevDepthGuard;
+
+impl Drop for DevDepthGuard {
+    fn drop(&mut self) {
+        DEV_PAYLOAD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Reads `dev`'s decoded payloads of each raw text (P5 review 1, finding 2):
+/// each payload is lexed and checked like a line of its own, from the same
+/// start directory (its `cd` context is part of its text).
+fn check_dev_payloads(
+    record: &BestEffortRecord,
+    protected: &ProtectedSet,
+    start_cwd: &[u8],
+    opts: &BestEffortOptions<'_>,
+    budget: &mut ComputeBudget,
+    out: &mut Vec<PartResult>,
+) -> Result<(), Exhausted> {
+    if DEV_PAYLOAD_DEPTH.with(std::cell::Cell::get) >= MAX_DEV_PAYLOAD_DEPTH {
+        return Ok(());
+    }
+    for raw in &record.raw_texts {
+        let payloads = dev_readings::dev_payloads(raw, protected.folds, budget)?;
+        for p in payloads {
+            if p.pipe_to_shell {
+                push_be_hit(
+                    out,
+                    PartId::WholeCall,
+                    "pipe-to-shell",
+                    HitMatch::CommandWord {
+                        word: "pipe-to-shell".to_owned(),
+                    },
+                    budget,
+                )?;
+            }
+            if p.text.trim().is_empty() {
+                continue;
+            }
+            let nested = match crate::policy::v4::lex::lex_best_effort(&[p.text.as_str()], budget) {
+                Ok(r) => r,
+                Err(PartOutcome::Exhausted(reason)) => return Err(Exhausted { reason }),
+                // A payload the best-effort lexer can't read adds no hit (§2
+                // only adds hits; the modeled pass judges the line).
+                Err(_) => continue,
+            };
+            DEV_PAYLOAD_DEPTH.with(|d| d.set(d.get() + 1));
+            let _guard = DevDepthGuard;
+            run_best_effort_into(&nested, protected, start_cwd, opts, budget, out)?;
+        }
+    }
+    Ok(())
+}
 const PRIV: &[&str] = &["sudo", "sudoedit", "su", "doas", "pkexec", "run0"];
 
 const WRITERS: &[&str] = &[
@@ -470,6 +535,10 @@ pub(super) fn run_best_effort_into(
             derived_unit_ordinal = 0;
         }
     }
+
+    // 4. `dev`'s decoded payloads (echo/printf/yes, here-documents, process
+    //    substitutions, substituted words, `script` forms, `ls | xargs`).
+    check_dev_payloads(record, protected, start_cwd, opts, budget, out)?;
 
     Ok(())
 }
