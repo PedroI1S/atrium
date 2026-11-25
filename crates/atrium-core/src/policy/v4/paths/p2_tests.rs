@@ -7771,9 +7771,11 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
             .count()
     };
 
-    // 1. Direct checks with an incomplete alias table (unlistable `.azure`
-    //    folder; `ProtectedSet` gap is `Through(azure)` only, so `check_target`
-    //    alone is Clear on `/mnt/keys/absent_key` and `/mnt/keys/sub`).
+    // 1. Direct checks with an incomplete alias table AND an `AnyTarget` gap
+    //    in `ProtectedSet` (unlistable `.azure` folder present before
+    //    `build_protected_set`: `folded_spellings` for `.azure/accesstokens.json`
+    //    records an `AnyTarget` gap, and `RootAliases::spelled_roots` marks the
+    //    alias table incomplete with the same reason).
     let mut fs = FakeFs::new();
     fs.mkdir_all(&ssh_sub);
     fs.add_file(&ssh_pub);
@@ -7791,17 +7793,31 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
     fs.add_symlink(b"/h/u/lnk_root2", b"/tmp/pub2/inner");
     fs.add_symlink(b"/tmp/pub2/.ssh/sub/to_pub", b"/mnt/keys/id_rsa.pub");
     let prot = default_build(&fs);
+    assert!(
+        prot.identity_gaps.iter().any(|g| {
+            g.scope == GapScope::AnyTarget
+                && !g.write_only
+                && matches!(&g.reason, UnreadReason::UnresolvablePath { path } if path == &azure_dir)
+        }),
+        "expected AnyTarget gap for unlistable .azure, got {:?}",
+        prot.identity_gaps
+    );
 
-    // Confirm pure `check_target` (without `RootAliases`) returns Clear for
-    // both targets, proving the HardDenyHit comes ONLY from the alias spelling.
+    // Pure `check_target` (without `RootAliases`) finds NO hit on
+    // `/mnt/keys/absent_key` or `/mnt/keys/sub` (it reports only the `AnyTarget`
+    // gap `Unread`), proving the `HardDenyHit` comes ONLY from the alias
+    // spelling and that `push_target_records` suppresses BOTH the incomplete
+    // alias table and the `ProtectedSet` gap once the alias hits.
     for raw in [b"/mnt/keys/absent_key".as_slice(), b"/mnt/keys/sub"] {
         let t = literal(raw, AccessMode::Read, &fs);
         assert_eq!(
             check_target(&t, &prot, &mut ComputeBudget::with_default_limits())
                 .unwrap()
                 .outcome,
-            PartOutcome::Clear,
-            "check_target alone must be Clear for {:?}",
+            PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                path: azure_dir.clone()
+            }),
+            "check_target alone must not hit for {:?}",
             String::from_utf8_lossy(raw)
         );
     }
@@ -7872,9 +7888,10 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
         );
     }
 
-    // 2. Direct check with incomplete alias table caused by `Canonicalizations`
-    //    cap = 1 (zero `ProtectedSet::identity_gaps`): alias HardDenyHit still
-    //    suppresses the incomplete-table Unread, while `/mnt/keys/config` keeps it.
+    // 2. Pure incomplete alias table with zero `ProtectedSet::identity_gaps`:
+    //    2a. `Canonicalizations` cap = 1 cuts off `RootAliases::roots`:
+    //        pure `check_target` is Clear, alias HardDenyHit suppresses the
+    //        incomplete-table Unread, while `/mnt/keys/config` keeps it.
     let mut cap_fs = FakeFs::new();
     cap_fs.add_file(&ssh_cfg);
     cap_fs.bind_dir(&ssh_dir, b"/mnt/keys");
@@ -7882,6 +7899,18 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
     cap_fs.mkdir_all(&gnupg_dir);
     let cap_prot = default_build(&cap_fs);
     assert!(cap_prot.identity_gaps.is_empty());
+
+    let cap_absent_target = literal(b"/mnt/keys/absent_key", AccessMode::Read, &cap_fs);
+    assert_eq!(
+        check_target(
+            &cap_absent_target,
+            &cap_prot,
+            &mut ComputeBudget::with_default_limits()
+        )
+        .unwrap()
+        .outcome,
+        PartOutcome::Clear
+    );
 
     let cap_hit = resolve_subject_paths(
         &["/mnt/keys/absent_key".to_string()],
@@ -7922,6 +7951,66 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
         UnreadReason::WalkCapReached(FsCap::Canonicalizations)
     )));
 
+    //    2b. Clean `ProtectedSet` (`identity_gaps.is_empty()`) where `.azure`
+    //        becomes unlistable only when `RootAliases` runs: pure
+    //        `check_target` returns Clear on every bind-mounted target and
+    //        followed link, while both direct checks and `check_recursive_root`'s
+    //        followed-link walk emit the alias HardDenyHit with zero spurious
+    //        Unreads.
+    let mut post_fs = FakeFs::new();
+    post_fs.mkdir_all(&ssh_sub);
+    post_fs.add_file(&ssh_pub);
+    post_fs.add_file(&ssh_cfg);
+    post_fs.bind_dir(&ssh_dir, b"/mnt/keys");
+    post_fs.mkdir_all(&azure_dir);
+    post_fs.add_symlink(b"/h/u/proj_alias/to_key", b"/mnt/keys/absent_key");
+    post_fs.add_symlink(b"/h/u/proj_pub/to_pub", b"/mnt/keys/id_rsa.pub");
+    post_fs.mkdir_all(b"/tmp/pub/inner");
+    post_fs.add_symlink(b"/h/u/lnk_root", b"/tmp/pub/inner");
+    post_fs.add_symlink(b"/tmp/pub/.ssh/sub/to_key", b"/mnt/keys/absent_key");
+    let post_prot = default_build(&post_fs);
+    assert!(post_prot.identity_gaps.is_empty());
+    post_fs.set_dir_read_error(&azure_dir, FsIoError::PermissionDenied);
+
+    for raw in [
+        b"/mnt/keys/absent_key".as_slice(),
+        b"/mnt/keys/sub",
+        b"/h/u/proj_alias/to_key",
+        b"/tmp/pub/.ssh/sub/to_key",
+    ] {
+        let t = literal(raw, AccessMode::Read, &post_fs);
+        assert_eq!(
+            check_target(&t, &post_prot, &mut ComputeBudget::with_default_limits())
+                .unwrap()
+                .outcome,
+            PartOutcome::Clear,
+            "pure check_target with clean ProtectedSet must be Clear for {:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+    let post_direct = subject(
+        "/mnt/keys/absent_key",
+        AccessMode::Read,
+        &post_prot,
+        &post_fs,
+    );
+    assert!(
+        has_hard_deny_path(&post_direct.outcomes, &ssh_absent_expected),
+        "{:?}",
+        post_direct.outcomes
+    );
+    assert!(
+        !has_unread(&post_direct.outcomes, |_| true),
+        "{:?}",
+        post_direct.outcomes
+    );
+    let post_cfg = subject("/mnt/keys/config", AccessMode::Read, &post_prot, &post_fs);
+    assert!(!has_any_hard_deny(&post_cfg.outcomes));
+    assert!(has_unread(&post_cfg.outcomes, |r| matches!(
+        r,
+        UnreadReason::UnresolvablePath { path } if path == &azure_dir
+    )));
+
     // 3. Through `check_recursive_root`'s followed-link walk
     //    (`LinkPolicy { at_root: true, below_root: true }`).
     let follow = LinkPolicy {
@@ -7955,7 +8044,9 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
             )
             .unwrap()
             .outcome,
-            PartOutcome::Clear
+            PartOutcome::Unread(UnreadReason::UnresolvablePath {
+                path: azure_dir.clone()
+            })
         );
         let rec = check_recursive_root(
             &literal(root_rel, AccessMode::Read, &fs),
@@ -7980,6 +8071,46 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
         );
     }
 
+    let post_rec = check_recursive_root(
+        &literal(b"proj_alias", AccessMode::Read, &post_fs),
+        follow,
+        &[],
+        &post_prot,
+        &post_fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(
+        has_hard_deny_path(&post_rec.outcomes, &ssh_absent_expected),
+        "{:?}",
+        post_rec.outcomes
+    );
+    assert_eq!(
+        unread_count(&post_rec.outcomes),
+        1,
+        "{:?}",
+        post_rec.outcomes
+    );
+
+    let post_rec_pub = check_recursive_root(
+        &literal(b"proj_pub", AccessMode::Read, &post_fs),
+        follow,
+        &[],
+        &post_prot,
+        &post_fs,
+        &mut FsCaps::with_default_limits(),
+        &mut ComputeBudget::with_default_limits(),
+    )
+    .unwrap();
+    assert!(!has_any_hard_deny(&post_rec_pub.outcomes));
+    assert_eq!(
+        unread_count(&post_rec_pub.outcomes),
+        2,
+        "{:?}",
+        post_rec_pub.outcomes
+    );
+
     let rec_pub = check_recursive_root(
         &literal(b"proj_pub", AccessMode::Read, &fs),
         follow,
@@ -8000,37 +8131,45 @@ fn round13_alias_only_hard_deny_suppresses_incomplete_table_unread() {
 
     // 3b. Written hard-deny root resolving to an external folder holding the
     //     followed link (`lnk_root/../.ssh/sub` -> `/tmp/pub/.ssh/sub`): the
-    //     root itself emits no Unread, the link target alone is Clear, and the
-    //     entire `check_recursive_root` call emits the alias HardDenyHit with
-    //     zero Unreads total (while the `.pub` link counterpart emits Unread).
+    //     root itself emits no Unread, the link target alone has no hit, and
+    //     the entire `check_recursive_root` call emits the alias HardDenyHit
+    //     with zero Unreads total (while the `.pub` link counterpart emits
+    //     Unread).
     let ext_link = literal(b"/tmp/pub/.ssh/sub/to_key", AccessMode::Read, &fs);
     assert_eq!(
         check_target(&ext_link, &prot, &mut ComputeBudget::with_default_limits())
             .unwrap()
             .outcome,
-        PartOutcome::Clear
+        PartOutcome::Unread(UnreadReason::UnresolvablePath {
+            path: azure_dir.clone()
+        })
     );
     let written_root_hit = [b"lnk_root".as_slice(), b"..", b".ssh", b"sub"].join(&b'/');
-    let rec_zero = check_recursive_root(
-        &literal(&written_root_hit, AccessMode::Read, &fs),
-        follow,
-        &[],
-        &prot,
-        &fs,
-        &mut FsCaps::with_default_limits(),
-        &mut ComputeBudget::with_default_limits(),
-    )
-    .unwrap();
-    assert!(
-        has_hard_deny_path(&rec_zero.outcomes, &ssh_absent_expected),
-        "{:?}",
-        rec_zero.outcomes
-    );
-    assert!(
-        !has_unread(&rec_zero.outcomes, |_| true),
-        "{:?}",
-        rec_zero.outcomes
-    );
+    for (label, cur_prot, cur_fs) in [
+        ("with_gap", &prot, &fs),
+        ("clean_prot", &post_prot, &post_fs),
+    ] {
+        let rec_zero = check_recursive_root(
+            &literal(&written_root_hit, AccessMode::Read, cur_fs),
+            follow,
+            &[],
+            cur_prot,
+            cur_fs,
+            &mut FsCaps::with_default_limits(),
+            &mut ComputeBudget::with_default_limits(),
+        )
+        .unwrap();
+        assert!(
+            has_hard_deny_path(&rec_zero.outcomes, &ssh_absent_expected),
+            "{label}: {:?}",
+            rec_zero.outcomes
+        );
+        assert!(
+            !has_unread(&rec_zero.outcomes, |_| true),
+            "{label}: {:?}",
+            rec_zero.outcomes
+        );
+    }
 
     let written_root_pub = [b"lnk_root2".as_slice(), b"..", b".ssh", b"sub"].join(&b'/');
     let rec_zero_pub = check_recursive_root(

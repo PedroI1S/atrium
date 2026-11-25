@@ -1410,7 +1410,7 @@ pub(crate) fn check_target_impl(
     budget: &mut ComputeBudget,
 ) -> Result<PartResult, Exhausted> {
     let mut records: Vec<PartResult> = Vec::new();
-    if let Err(e) = check_target_into(target, protected, budget, &mut records, true) {
+    if let Err(e) = check_target_into(target, protected, budget, &mut records, true, true) {
         return match records
             .into_iter()
             .find(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
@@ -1434,6 +1434,38 @@ pub(crate) fn check_target_impl(
         .expect("check_target_into records at least one outcome"))
 }
 
+/// Attaches the first applicable [`ProtectedSet::identity_gaps`] entry to `out`
+/// when `out[start..]` holds only `Clear` / `StoreHit` outcomes (i.e. neither
+/// a `HardDenyHit` nor an `Unread` was established for this target;
+/// `model.rs` `ProtectedSet::identity_gaps`, D-144, D-145).
+fn attach_applicable_gap(
+    target: &Target,
+    protected: &ProtectedSet,
+    budget: &mut ComputeBudget,
+    out: &mut Vec<PartResult>,
+    start: usize,
+) -> Result<(), Exhausted> {
+    if out[start..]
+        .iter()
+        .all(|r| matches!(r.outcome, PartOutcome::Clear | PartOutcome::StoreHit(_)))
+        && let Some(gap) = applicable_gap(target, protected, budget)?
+    {
+        let part = origin_to_part(&target.origin);
+        let bytes = unread_reason_alloc_bytes(&gap.reason);
+        budget.charge(bytes as u64 + 1)?;
+        budget.charge_alloc(bytes)?;
+        push_charged(
+            out,
+            PartResult {
+                part,
+                outcome: PartOutcome::Unread(gap.reason.clone()),
+            },
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
 /// Appends every record of `target` to `out` (§1 keeps every hit and every
 /// reason for doubt), each as soon as it is established, so a later
 /// exhaustion never loses it (§8; review 6, finding 1):
@@ -1444,7 +1476,10 @@ pub(crate) fn check_target_impl(
 ///   unlisted equivalences);
 /// - the unlisted equivalences (NFC/NFD, unlisted case folds) of the written
 ///   spelling, when nothing else matched (§11 item 13);
-/// - the identity gap that applies, beside a Clear or Store-hit outcome.
+/// - when `attach_gap` is `true`, the identity gap that applies beside a
+///   `Clear` or `StoreHit` outcome (resolver-backed callers pass `false` and
+///   attach the gap after [`push_alias_records`] so an alias-only
+///   `HardDenyHit` never carries a spurious gap `Unread`).
 ///
 /// A hard-deny hit ends the list. A Clear outcome is recorded only when
 /// `keep_clear`. Variant-only matches are never hits, so their written
@@ -1455,6 +1490,7 @@ pub(crate) fn check_target_into(
     budget: &mut ComputeBudget,
     out: &mut Vec<PartResult>,
     keep_clear: bool,
+    attach_gap: bool,
 ) -> Result<(), Exhausted> {
     let part = origin_to_part(&target.origin);
     let variant_only = matches!(
@@ -1514,7 +1550,7 @@ pub(crate) fn check_target_into(
                 if shared.matches_unlisted_equivalence(w, target.access, budget)? {
                     budget.charge_alloc(w.len())?;
                     record = PartResult {
-                        part: part.clone(),
+                        part,
                         outcome: PartOutcome::Unread(UnreadReason::UnlistedNameEquivalence {
                             path: w.to_vec(),
                         }),
@@ -1528,23 +1564,8 @@ pub(crate) fn check_target_into(
         _ => {}
     }
 
-    // The identity gap that applies, beside a Clear or Store-hit outcome.
-    if out[start..]
-        .iter()
-        .all(|r| matches!(r.outcome, PartOutcome::Clear | PartOutcome::StoreHit(_)))
-        && let Some(gap) = applicable_gap(target, protected, budget)?
-    {
-        let bytes = unread_reason_alloc_bytes(&gap.reason);
-        budget.charge(bytes as u64 + 1)?;
-        budget.charge_alloc(bytes)?;
-        push_charged(
-            out,
-            PartResult {
-                part,
-                outcome: PartOutcome::Unread(gap.reason.clone()),
-            },
-            budget,
-        )?;
+    if attach_gap {
+        attach_applicable_gap(target, protected, budget, out, start)?;
     }
     Ok(())
 }
@@ -2153,18 +2174,21 @@ pub(crate) fn push_target_records(
     keep_clear: bool,
 ) -> Result<(), Exhausted> {
     let start = outcomes.len();
-    check_target_into(target, protected, budget, outcomes, keep_clear)?;
-    // Once this target has a HardDenyHit, skip alias scanning so an incomplete
-    // alias table never attaches a spurious Unread alongside a definitive hit
-    // (contract §1, §5; ProtectedSet::identity_gaps; D-144, D-145; review 7
-    // finding 3).
+    check_target_into(target, protected, budget, outcomes, keep_clear, false)?;
+    // Once this target has a HardDenyHit, skip alias scanning and identity-gap
+    // attachment so an incomplete table or gap never attaches a spurious Unread
+    // alongside a definitive hit (contract §1, §5; ProtectedSet::identity_gaps;
+    // D-144, D-145; review 7 finding 3).
     if outcomes[start..]
         .iter()
         .any(|r| matches!(r.outcome, PartOutcome::HardDenyHit(_)))
     {
         return Ok(());
     }
-    push_alias_records(target, protected, resolver, caps, budget, aliases, outcomes)
+    push_alias_records(target, protected, resolver, caps, budget, aliases, outcomes)?;
+    // Attach an applicable identity gap only when neither the direct check nor
+    // the alias check produced a HardDenyHit or an Unread.
+    attach_applicable_gap(target, protected, budget, outcomes, start)
 }
 
 impl ProtectedRoot {
