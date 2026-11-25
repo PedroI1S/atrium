@@ -230,10 +230,11 @@ fn evaluate_sync(
     };
 
     let resolver = v4::paths::FsResolver::new();
-    let mut budget = ComputeBudget::with_default_limits();
-    // Give `build_protected_set` its own `FsCaps` so its protected-root scans
-    // do not consume the call's filesystem caps (contract §8).
+    // Give `build_protected_set` its own `FsCaps` and `ComputeBudget` so its
+    // discovery/protected-root walks stay strictly bounded without starving the
+    // call's own caps or compute budget (contract §8).
     let mut protected_caps = FsCaps::with_default_limits();
+    let mut protected_budget = ComputeBudget::with_default_limits();
     let home_bytes = path_to_bytes(&c.home);
     let cwd_bytes = path_to_bytes(&c.cwd);
     let data_bytes: Vec<Vec<u8>> = c
@@ -255,7 +256,7 @@ fn evaluate_sync(
         FoldRules::REV4,
         &resolver,
         &mut protected_caps,
-        &mut budget,
+        &mut protected_budget,
     ) {
         Ok(p) => p,
         Err(_) => {
@@ -267,8 +268,7 @@ fn evaluate_sync(
         }
     };
 
-    let eval =
-        v4::evaluate::evaluate_call_with_budget(&input, rules, &protected, &resolver, &mut budget);
+    let eval = v4::evaluate::evaluate_call(&input, rules, &protected, &resolver);
     let unread = v4::evaluate::unread_notice_for_outcome(&eval.outcome);
     let remember_matcher = if unread.is_some() {
         None
