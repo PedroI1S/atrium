@@ -1071,3 +1071,8 @@ D-141 removed flag arities from these rows precisely to avoid this.
 - **P3 (M1-39):** round 4 is written by Neon `xhigh` from `b021ad4`. It follows D-156's ruling (trigger and code detection never consumes option values), removes the arity modelling outside the frozen table in core and in `app/src/chat/rule-form.ts` together, and fixes review 3's three findings.
 - **Unchanged:** reviews by Codex (GPT-6.1 Sol, `high`, read-only); D-123's write-then-verify flow; D-120's 100% gate. Work that needs path-like literals the `agy` policy refuses (D-074) goes back to Claude.
 - **First:** the `agy` 1.5.15 hook check (D-158).
+
+## D-162 — 2026-11-24 — Pedro: Sonnet 5.5 reviews P2 and P3 while Codex is out
+**Decided by Pedro (driver).** Codex has no usage left on Pedro's account; on its ChatGPT login it refuses `gpt-6.1-sol`, `gpt-6.1`, `gpt-6-astra` and `gpt-6`. So **Claude Sonnet 5.5** replaces Codex (D-124) as the reviewer for P2 (M1-38) and P3 (M1-39) on Pedro's shifts. It runs as a read-only Claude subagent in the task's worktree, with the same review prompt and the same D-120 rules.
+- **Cross-provider:** Sonnet (Anthropic) reviewing Neon (Google). P2's round 10 was written by Opus, but review 9 is followed by Neon's round 11, and every later round is reviewed again.
+- **Codex goes back to reviewing** when the usage returns, or on rodrigo's shifts.
