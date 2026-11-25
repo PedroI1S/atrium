@@ -822,6 +822,10 @@ fn conditional_runner_sed_script_parser_and_program_pin() {
         vec![w("sed"), w("-n"), wq("1,5p"), w("a.txt")],
         vec![w("sed"), w("-E"), w("-e"), wq("s|error|ok|g"), w("a.txt")],
         vec![w("sed"), wq("z"), w("a.txt")],
+        vec![w("sed"), wq("s/é/x/"), w("a.txt")],
+        vec![w("sed"), wq("s/x/é/"), w("a.txt")],
+        vec![w("sed"), w("-n"), wq("y/é/ü/"), w("a.txt")],
+        vec![w("sed"), w("-n"), wq("\\+é+p"), w("a.txt")],
     ] {
         let e = classify_words(safe.clone());
         assert!(e.unread.is_empty(), "expected safe sed for {safe:?}");
@@ -864,6 +868,10 @@ fn conditional_runner_sed_script_parser_and_program_pin() {
         "1R in.txt",
         "{p;e id}",
         "s/unclosed",
+        "s€a€b€",
+        "s€a€b€p",
+        "y€ab€cd€",
+        "\\€re€p",
     ] {
         let e = classify_words(vec![w("sed"), wq(bad), w("a.txt")]);
         assert_eq!(

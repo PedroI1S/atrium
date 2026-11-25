@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ListedRule } from "../daemon/types";
 import {
@@ -288,6 +290,67 @@ describe("rules editor: stored invalid rules (§11 item 5)", () => {
     expect(marked[0]!.invalid_reason).toBeNull();
     expect(marked[1]!.invalid_reason).toMatch(/awk/);
     expect(marked[2]!.invalid_reason).toBeNull();
+  });
+
+  it("refuses non-ASCII sed delimiters in both commandRisk and checkStoredRule, while accepting ASCII delimiters with non-ASCII text", () => {
+    const badNonAsciiDelim: string[][] = [
+      ["sed", "s€a€b€"],
+      ["sed", "-n", "s€a€b€p"],
+      ["sed", "-n", "y€ab€cd€"],
+      ["sed", "-n", "\\€re€p"],
+    ];
+    for (const argv of badNonAsciiDelim) {
+      const label = JSON.stringify(argv);
+      expect(commandRisk(argv, "command_prefix"), label).toMatchObject({ refuse: expect.any(String) });
+      const stored = checkStoredRule(storedRule({ matcher: { type: "command_prefix", argv } }));
+      expect(stored.valid, label).toBe(false);
+      expect(typeof stored.reason === "string" && stored.reason.length > 0, label).toBe(true);
+    }
+
+    const okAsciiDelimNonAsciiText: string[][] = [
+      ["sed", "s/é/x/"],
+      ["sed", "s/x/é/"],
+      ["sed", "-n", "s/é/ü/gp"],
+      ["sed", "-n", "y/é/ü/"],
+      ["sed", "-n", "/é/p"],
+      ["sed", "-n", "\\+é+p"],
+      ["sed", "-n", "s|é|€|p"],
+    ];
+    for (const argv of okAsciiDelimNonAsciiText) {
+      const label = JSON.stringify(argv);
+      expect(commandRisk(argv, "command_prefix"), label).toBeNull();
+      expect(checkStoredRule(storedRule({ matcher: { type: "command_prefix", argv } })), label).toEqual({
+        valid: true,
+        reason: null,
+      });
+    }
+  });
+
+  it("matches core validate_rule_matcher on every shared rule_validation_fixtures.json case", () => {
+    interface RuleValidationFixture {
+      argv: string[];
+      valid: boolean;
+    }
+    const fixtures: RuleValidationFixture[] = JSON.parse(
+      readFileSync(
+        join(import.meta.dirname, "../../../crates/atrium-core/src/policy/v4/rules/rule_validation_fixtures.json"),
+        "utf8",
+      ),
+    );
+    expect(fixtures.length).toBeGreaterThan(0);
+    for (const { argv, valid } of fixtures) {
+      const label = JSON.stringify(argv);
+      const risk = commandRisk(argv, "command_prefix");
+      const refused = risk !== null && "refuse" in risk;
+      expect(!refused, label).toBe(valid);
+      const stored = checkStoredRule(storedRule({ matcher: { type: "command_prefix", argv } }));
+      expect(stored.valid, label).toBe(valid);
+      if (valid) {
+        expect(stored.reason, label).toBeNull();
+      } else {
+        expect(typeof stored.reason === "string" && stored.reason.length > 0, label).toBe(true);
+      }
+    }
   });
 });
 

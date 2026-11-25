@@ -250,26 +250,85 @@ function hasCompetingSedFlags(rest: readonly string[]): boolean {
   return false;
 }
 
+const UTF8_ENCODER = new TextEncoder();
+
+const asciiByte = (ch: string): number => ch.charCodeAt(0);
+const byteSet = (chars: string): ReadonlySet<number> => new Set([...chars].map((ch) => ch.charCodeAt(0)));
+
+const B_SPACE = asciiByte(" ");
+const B_TAB = asciiByte("\t");
+const B_CR = asciiByte("\r");
+const B_LF = asciiByte("\n");
+const B_SEMI = asciiByte(";");
+const B_HASH = asciiByte("#");
+const B_LBRACE = asciiByte("{");
+const B_RBRACE = asciiByte("}");
+const B_COMMA = asciiByte(",");
+const B_BANG = asciiByte("!");
+const B_DOLLAR = asciiByte("$");
+const B_0 = asciiByte("0");
+const B_9 = asciiByte("9");
+const B_PLUS = asciiByte("+");
+const B_TILDE = asciiByte("~");
+const B_SLASH = asciiByte("/");
+const B_BSLASH = asciiByte("\\");
+const B_LBRACK = asciiByte("[");
+const B_RBRACK = asciiByte("]");
+const B_COLON = asciiByte(":");
+const B_DOT = asciiByte(".");
+const B_EQ = asciiByte("=");
+const B_CARET = asciiByte("^");
+const B_I = asciiByte("I");
+const B_M = asciiByte("M");
+const B_s = asciiByte("s");
+const B_y = asciiByte("y");
+const B_q = asciiByte("q");
+const B_Q = asciiByte("Q");
+const B_l = asciiByte("l");
+const B_b = asciiByte("b");
+const B_t = asciiByte("t");
+const B_T = asciiByte("T");
+const B_a = asciiByte("a");
+const B_i = asciiByte("i");
+const B_c = asciiByte("c");
+
+const SED_TRIGGER_CMD_BYTES = byteSet("ewrWR");
+const SED_SUBST_TRIGGER_FLAG_BYTES = byteSet("ewrW");
+const SED_SUBST_SAFE_FLAG_BYTES = byteSet("gpIiMm0123456789");
+const SED_ZERO_ARG_CMD_BYTES = byteSet("dDgGhHnNpPx=zF");
+
 /**
- * Linear `sed` script inspector mirroring `crates/atrium-core/src/policy/v4/tools/sed.rs`
- * 1-to-1 (`e`, `w`, `r`, `W`, `R`, `s///e|w|W`, safe commands including `z`, `F`, `l`, `q`, `Q`).
+ * Linear UTF-8 byte-level `sed` script inspector mirroring
+ * `crates/atrium-core/src/policy/v4/tools/sed.rs::inspect_sed_script` 1-to-1
+ * (`e`, `w`, `r`, `W`, `R`, `s///e|w|W`, safe commands including `z`, `F`, `l`, `q`, `Q`).
+ *
+ * Scans UTF-8 bytes (`TextEncoder`) exactly like core so non-ASCII `s`/`y`/`\`
+ * delimiters fail closed to `false` while non-ASCII bytes inside regex/replacement
+ * text under an ASCII delimiter (`s/é/x/`) stay accepted.
  */
 function isSedScriptSafe(script: string): boolean {
-  const n = script.length;
+  const bytes = UTF8_ENCODER.encode(script);
+  const n = bytes.length;
   let i = 0;
 
-  const scanRegexToDelim = (delim: string): boolean => {
+  const isAsciiDigit = (byte: number): boolean => byte >= B_0 && byte <= B_9;
+
+  const scanRegexToDelim = (delim: number): boolean => {
     let inClass = false;
     let classFirst = false;
     while (i < n) {
-      const ch = script[i]!;
+      const byte = bytes[i]!;
       if (inClass) {
-        if (ch === "[" && i + 1 < n && (script[i + 1] === ":" || script[i + 1] === "." || script[i + 1] === "=")) {
-          const marker = script[i + 1]!;
+        if (
+          byte === B_LBRACK &&
+          i + 1 < n &&
+          (bytes[i + 1] === B_COLON || bytes[i + 1] === B_DOT || bytes[i + 1] === B_EQ)
+        ) {
+          const marker = bytes[i + 1]!;
           i += 2;
           let closed = false;
           while (i + 1 < n) {
-            if (script[i] === marker && script[i + 1] === "]") {
+            if (bytes[i] === marker && bytes[i + 1] === B_RBRACK) {
               i += 2;
               closed = true;
               break;
@@ -280,12 +339,12 @@ function isSedScriptSafe(script: string): boolean {
           classFirst = false;
           continue;
         }
-        if (ch === "]" && !classFirst) {
+        if (byte === B_RBRACK && !classFirst) {
           inClass = false;
           i++;
           continue;
         }
-        if (ch === "^" && classFirst) {
+        if (byte === B_CARET && classFirst) {
           i++;
           continue;
         }
@@ -293,17 +352,17 @@ function isSedScriptSafe(script: string): boolean {
         i++;
         continue;
       }
-      if (ch === "\\") {
+      if (byte === B_BSLASH) {
         if (i + 1 >= n) return false;
         i += 2;
         continue;
       }
-      if (ch === delim) {
+      if (byte === delim) {
         i++;
         return true;
       }
-      if (ch === "\n") return false;
-      if (ch === "[") {
+      if (byte === B_LF) return false;
+      if (byte === B_LBRACK) {
         inClass = true;
         classFirst = true;
         i++;
@@ -314,19 +373,19 @@ function isSedScriptSafe(script: string): boolean {
     return false;
   };
 
-  const scanReplacementToDelim = (delim: string): boolean => {
+  const scanReplacementToDelim = (delim: number): boolean => {
     while (i < n) {
-      const ch = script[i]!;
-      if (ch === "\\") {
+      const byte = bytes[i]!;
+      if (byte === B_BSLASH) {
         if (i + 1 >= n) return false;
         i += 2;
         continue;
       }
-      if (ch === delim) {
+      if (byte === delim) {
         i++;
         return true;
       }
-      if (ch === "\n") return false;
+      if (byte === B_LF) return false;
       i++;
     }
     return false;
@@ -334,37 +393,37 @@ function isSedScriptSafe(script: string): boolean {
 
   const skipAddr = (): "yes" | "no" | "bad" => {
     if (i >= n) return "no";
-    const ch = script[i]!;
-    if (ch === "$") { i++; return "yes"; }
-    if (ch >= "0" && ch <= "9") {
-      while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
-      if (i < n && (script[i] === "~" || script[i] === "+")) {
+    const byte = bytes[i]!;
+    if (byte === B_DOLLAR) { i++; return "yes"; }
+    if (isAsciiDigit(byte)) {
+      while (i < n && isAsciiDigit(bytes[i]!)) i++;
+      if (i < n && (bytes[i] === B_TILDE || bytes[i] === B_PLUS)) {
         i++;
         const start = i;
-        while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
+        while (i < n && isAsciiDigit(bytes[i]!)) i++;
         if (i === start) return "bad";
       }
       return "yes";
     }
-    if (ch === "+" || ch === "~") {
+    if (byte === B_PLUS || byte === B_TILDE) {
       i++;
       const start = i;
-      while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
+      while (i < n && isAsciiDigit(bytes[i]!)) i++;
       return i === start ? "bad" : "yes";
     }
-    if (ch === "/") {
+    if (byte === B_SLASH) {
       i++;
-      if (!scanRegexToDelim("/")) return "bad";
-      while (i < n && (script[i] === "I" || script[i] === "M")) i++;
+      if (!scanRegexToDelim(B_SLASH)) return "bad";
+      while (i < n && (bytes[i] === B_I || bytes[i] === B_M)) i++;
       return "yes";
     }
-    if (ch === "\\") {
+    if (byte === B_BSLASH) {
       if (i + 1 >= n) return "bad";
-      const d = script[i + 1]!;
-      if (d === "\n" || d === "\\") return "bad";
+      const d = bytes[i + 1]!;
+      if (d === B_LF || d === B_BSLASH) return "bad";
       i += 2;
       if (!scanRegexToDelim(d)) return "bad";
-      while (i < n && (script[i] === "I" || script[i] === "M")) i++;
+      while (i < n && (bytes[i] === B_I || bytes[i] === B_M)) i++;
       return "yes";
     }
     return "no";
@@ -372,13 +431,18 @@ function isSedScriptSafe(script: string): boolean {
 
   let blockDepth = 0;
   while (i < n) {
-    while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r" || script[i] === "\n" || script[i] === ";")) i++;
+    while (
+      i < n &&
+      (bytes[i] === B_SPACE || bytes[i] === B_TAB || bytes[i] === B_CR || bytes[i] === B_LF || bytes[i] === B_SEMI)
+    ) {
+      i++;
+    }
     if (i >= n) break;
-    if (script[i] === "#") {
-      while (i < n && script[i] !== "\n") i++;
+    if (bytes[i] === B_HASH) {
+      while (i < n && bytes[i] !== B_LF) i++;
       continue;
     }
-    if (script[i] === "}") {
+    if (bytes[i] === B_RBRACE) {
       if (blockDepth === 0) return false;
       blockDepth--;
       i++;
@@ -387,70 +451,70 @@ function isSedScriptSafe(script: string): boolean {
     const a1 = skipAddr();
     if (a1 === "bad") return false;
     if (a1 === "yes") {
-      while (i < n && (script[i] === " " || script[i] === "\t")) i++;
-      if (i < n && script[i] === ",") {
+      while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB)) i++;
+      if (i < n && bytes[i] === B_COMMA) {
         i++;
-        while (i < n && (script[i] === " " || script[i] === "\t")) i++;
+        while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB)) i++;
         if (skipAddr() !== "yes") return false;
       }
     }
-    while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "!")) i++;
+    while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB || bytes[i] === B_BANG)) i++;
     if (i >= n) return false;
-    const cmd = script[i]!;
+    const cmd = bytes[i]!;
     i++;
-    if (cmd === "{") { blockDepth++; continue; }
-    if (cmd === "e" || cmd === "w" || cmd === "r" || cmd === "W" || cmd === "R") return false;
-    if (cmd === "s") {
+    if (cmd === B_LBRACE) { blockDepth++; continue; }
+    if (SED_TRIGGER_CMD_BYTES.has(cmd)) return false;
+    if (cmd === B_s) {
       if (i >= n) return false;
-      const delim = script[i]!;
-      if (delim === "\n" || delim === "\\") return false;
+      const delim = bytes[i]!;
+      if (delim === B_LF || delim === B_BSLASH) return false;
       i++;
       if (!scanRegexToDelim(delim)) return false;
       if (!scanReplacementToDelim(delim)) return false;
       while (i < n) {
-        const f = script[i]!;
-        if (f === ";" || f === "\n" || f === "}" || f === "#") break;
-        if (f === " " || f === "\t" || f === "\r") { i++; continue; }
-        if (f === "e" || f === "w" || f === "W") return false;
-        if ("gpIiMm0123456789".includes(f)) { i++; continue; }
+        const f = bytes[i]!;
+        if (f === B_SEMI || f === B_LF || f === B_RBRACE || f === B_HASH) break;
+        if (f === B_SPACE || f === B_TAB || f === B_CR) { i++; continue; }
+        if (SED_SUBST_TRIGGER_FLAG_BYTES.has(f)) return false;
+        if (SED_SUBST_SAFE_FLAG_BYTES.has(f)) { i++; continue; }
         return false;
       }
       continue;
     }
-    if (cmd === "y") {
+    if (cmd === B_y) {
       if (i >= n) return false;
-      const delim = script[i]!;
-      if (delim === "\n" || delim === "\\") return false;
+      const delim = bytes[i]!;
+      if (delim === B_LF || delim === B_BSLASH) return false;
       i++;
       if (!scanReplacementToDelim(delim)) return false;
       if (!scanReplacementToDelim(delim)) return false;
       continue;
     }
-    if ("dDgGhHnNpPx=zF".includes(cmd)) {
-      while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r")) i++;
-      if (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "}" && script[i] !== "#") return false;
+    if (SED_ZERO_ARG_CMD_BYTES.has(cmd)) {
+      while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB || bytes[i] === B_CR)) i++;
+      if (i < n && bytes[i] !== B_SEMI && bytes[i] !== B_LF && bytes[i] !== B_RBRACE && bytes[i] !== B_HASH) return false;
       continue;
     }
-    if (cmd === "q" || cmd === "Q" || cmd === "l") {
-      while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r")) i++;
-      while (i < n && script[i]! >= "0" && script[i]! <= "9") i++;
-      while (i < n && (script[i] === " " || script[i] === "\t" || script[i] === "\r")) i++;
-      if (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "}" && script[i] !== "#") return false;
+    if (cmd === B_q || cmd === B_Q || cmd === B_l) {
+      while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB || bytes[i] === B_CR)) i++;
+      while (i < n && isAsciiDigit(bytes[i]!)) i++;
+      while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB || bytes[i] === B_CR)) i++;
+      if (i < n && bytes[i] !== B_SEMI && bytes[i] !== B_LF && bytes[i] !== B_RBRACE && bytes[i] !== B_HASH) return false;
       continue;
     }
-    if (cmd === ":" || cmd === "b" || cmd === "t" || cmd === "T") {
-      while (i < n && script[i] !== ";" && script[i] !== "\n" && script[i] !== "}" && script[i] !== "#") i++;
+    if (cmd === B_COLON || cmd === B_b || cmd === B_t || cmd === B_T) {
+      while (i < n && bytes[i] !== B_SEMI && bytes[i] !== B_LF && bytes[i] !== B_RBRACE && bytes[i] !== B_HASH) i++;
       continue;
     }
-    if (cmd === "a" || cmd === "i" || cmd === "c") {
-      while (i < n && (script[i] === " " || script[i] === "\t")) i++;
-      if (i < n && script[i] === "\\") {
+    if (cmd === B_a || cmd === B_i || cmd === B_c) {
+      while (i < n && (bytes[i] === B_SPACE || bytes[i] === B_TAB)) i++;
+      if (i < n && bytes[i] === B_BSLASH) {
         i++;
-        if (i < n && script[i] === "\n") i++;
+        if (i < n && bytes[i] === B_LF) i++;
       }
       while (i < n) {
-        if (script[i] === "\\" && i + 1 < n) { i += 2; continue; }
-        if (script[i] === "\n") { i++; break; }
+        if (bytes[i] === B_BSLASH && i + 1 < n) { i += 2; continue; }
+        if (bytes[i] === B_LF) { i++; break; }
         i++;
       }
       continue;

@@ -174,6 +174,10 @@ fn validate_rule_matcher_rejects_unpinned_allow_code_runner_prefixes() {
         &["sed", "-f", "-"],
         &["sed", "1e id"],
         &["sed", "s/a/b/w out"],
+        &["sed", "s€a€b€"],
+        &["sed", "-n", "s€a€b€p"],
+        &["sed", "-n", "y€ab€cd€"],
+        &["sed", "-n", "\\€re€p"],
         &["sh"],
         &["bash"],
         &["bash", "-c"],
@@ -264,6 +268,13 @@ fn validate_rule_matcher_accepts_pinned_allow_prefixes_and_exact_rules() {
         &["awk", "-f", "prog.awk"],
         &["sed", "-f", "edit.sed"],
         &["sed", "s/error/warn/g"],
+        &["sed", "s/é/x/"],
+        &["sed", "s/x/é/"],
+        &["sed", "-n", "s/é/ü/gp"],
+        &["sed", "-n", "y/é/ü/"],
+        &["sed", "-n", "/é/p"],
+        &["sed", "-n", "\\+é+p"],
+        &["sed", "-n", "s|é|€|p"],
         &["sh", "x.sh"],
         &["bash", "scripts/deploy.sh"],
         &["source", "env.sh"],
@@ -2301,6 +2312,40 @@ fn round4_review3_findings_1_2_3_coverage_and_precedence() {
         assert_eq!(
             cov.deny.as_ref().map(|(_, id)| id),
             Some(&RuleId("r_g_deny_git".into()))
+        );
+    }
+}
+
+#[test]
+fn shared_rule_validation_fixtures_match_core_and_public_validator() {
+    #[derive(serde::Deserialize)]
+    struct FixtureCase {
+        argv: Vec<String>,
+        valid: bool,
+    }
+
+    let cases: Vec<FixtureCase> =
+        serde_json::from_str(include_str!("rule_validation_fixtures.json"))
+            .expect("rule_validation_fixtures.json parses");
+    assert!(!cases.is_empty());
+
+    for case in cases {
+        let matcher = RuleMatcher::CommandPrefix {
+            argv: case.argv.clone(),
+        };
+        let core_res = validate_rule_matcher(&matcher, RuleDecision::Allow, &FoldRules::REV4);
+        assert_eq!(
+            core_res.is_ok(),
+            case.valid,
+            "v4 validate_rule_matcher mismatch for {:?}: {core_res:?}",
+            case.argv
+        );
+        let pub_res = crate::policy::validate_rule_matcher(&matcher, RuleDecision::Allow, None);
+        assert_eq!(
+            pub_res.is_ok(),
+            case.valid,
+            "public validate_rule_matcher mismatch for {:?}: {pub_res:?}",
+            case.argv
         );
     }
 }
