@@ -66,6 +66,16 @@ fn check_dev_payloads(
         return Ok(());
     }
     for raw in &record.raw_texts {
+        // Every generator needs a pipe, a redirection or here-document, a
+        // `$`/backtick word, or `script` (O1: most lines skip the scanner).
+        budget.charge(raw.len().max(1) as u64)?;
+        if !raw
+            .bytes()
+            .any(|b| matches!(b, b'|' | b'<' | b'>' | b'$' | b'`'))
+            && !raw.contains("script")
+        {
+            continue;
+        }
         let payloads = dev_readings::dev_payloads(raw, protected.folds, budget)?;
         for p in payloads {
             if p.pipe_to_shell {
