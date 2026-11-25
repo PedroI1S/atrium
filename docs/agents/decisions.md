@@ -1093,3 +1093,11 @@ D-141 removed flag arities from these rows precisely to avoid this.
   - Before deleting, each `origin` tip was tagged `archive/<task>` and the tags were pushed. The rev 4 briefs' disposition lists, and P5, still read hunks and tests from them.
   - The branches were deleted on `origin` and locally.
 - **Kept:** `agent/orchestrator/M1-33…`, `M1-34…` and `agent/neon/M1-35…` to `M1-37…`, `M1-40…` (merged, rodrigo's choice to keep), plus every branch still in flight.
+
+## D-165 — 2026-11-24 — Pedro: merge P3 (M1-39) into `dev`
+**Decided by Pedro (driver).** P3 (`agent/neon/M1-39-rev4-p3-tools-rules` @ `bbe928de`) is merged into `dev` as `b48e9324`.
+- **Review:** approved in Sonnet review round 5 with no findings (D-120, D-162; `reviews/M1-39-rev4-p3-tools-rules-round5.md`). The optional fixture rows it mentions are not findings.
+- **No rebase was needed.** `dev` had moved only in `docs/` since the branch merged `dev` in (`27a11d1c`, after P4), and `git merge-tree` was clean.
+- **The orchestrator's single verification of round 5, on macOS, in the worktree's own `target/` (D-123):** fmt and workspace clippy clean; `check-protocol-ts` up to date; **925 passed, 0 failed, 7 ignored**; app typecheck clean; **373 vitest** passed.
+- **Linux is owed for the M1 gate.** P3 is not wired into `SessionGate`; P5 (M1-41) does that.
+
