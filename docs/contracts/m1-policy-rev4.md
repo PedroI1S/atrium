@@ -80,6 +80,7 @@ The model reads a command line as the **intersection** of what POSIX `sh`, `bash
 - **Allowed characters:** the bytes `A–Z a–z 0–9 _ . / , : @ % + -` plus `=` (but not as a word's first byte, because of zsh's `=cmd`).
 - **Glob characters:** `*`, `?` and `[…]`, with no `!` or `^` inside the class.
 - **`~`:** only as a word's first byte, followed by `/` or the end of the word.
+- **`~` anywhere else in a word is a literal byte,** as bash and zsh read it (`HEAD~1`, `a~b`). The exception is a `~` right after a `=` or a `:` (`a=~/x`, `--opt=~/x`, `PATH=x:~/bin`): shells may tilde-expand it there, so the line is outside the model. **[§11, item 16; D-176]**
 - Any other unquoted byte puts the line outside the model. That covers `$`, backtick, `{`, `}`, `#`, `!`, `^`, `(`, `)`, `<` and `>` except in the redirects listed below, `&` other than `&&`, and non-ASCII.
 
 **Quotes and escapes:**
@@ -91,8 +92,8 @@ The model reads a command line as the **intersection** of what POSIX `sh`, `bash
 
 **Redirects, from this closed list:**
 - `<`, `>`, `>>`, `2>`, `2>>`, followed by a literal target;
-- `n>&m` with `n` and `m` in 0–2;
-- `n>&-` with `n` in 0–2.
+- `n>&m` with `n` and `m` in 0–2, and `>&m` with `m` in 0–2, which is the same as `1>&m`;
+- `n>&-` with `n` in 0–2, and `>&-`, which is the same as `1>&-`. A `>&` followed by anything else is a file redirect in bash, so it is outside the model. **[§11, item 16; D-176]**
 
 `&>` (not shared by POSIX `sh`), `<&` and every other descriptor number are outside the model. So `cat <&3` is Unread.
 - **Literal targets** are checked under §5, input as a read and output as a write. An output redirect makes the unit a writer, except one to `/dev/null`.
@@ -319,6 +320,12 @@ The columns are **Home / prefix or exact rule / Any rule / FullAccess**, with `h
     - reaching the walk cap is Unread.
 
     Added on 2026-11-22 (D-139): P0's review found that row 15 had no item here.
+16. **Two common spellings come back into the model** (§3): a `~` inside a word, other than right after `=` or `:`, is literal, so `git diff HEAD~1` is Allow in Home as on `dev`; and `>&m`/`>&-` without an explicit `n` are the same as `1>&m`/`1>&-`. Without this change, both were outside §3 and asked in Home.
+
+    Added on 2026-11-25 (D-176): P5's review 1, findings 6 and 7.
+17. **A folder linked from inside a protected tree is itself protected** (D-145 item 3). So `ls vault/work`, where `~/.ssh/work → vault/work`, is HardDeny, where `dev` allowed it (M1-03 finding 5).
+
+    Added on 2026-11-25 (D-176): P5's review 1, finding 7.
 
 **Unchanged on purpose:**
 - `ToolSubject::Unknown` asks everywhere.

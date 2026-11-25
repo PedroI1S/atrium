@@ -1153,3 +1153,23 @@ D-141 removed flag arities from these rows precisely to avoid this.
 
 ## D-175 — 2026-11-25 — Pedro: start P5 (M1-41)
 **Decided by Pedro (driver).** Both of P5's prerequisites are merged: P2 (D-174) and P3 (D-165). P5 starts on Neon `xhigh` (D-158, D-161), on `agent/neon/M1-41-rev4-p5-integration`, cut from `dev` at `5c4d154f`. Its review runs on Pedro's Claude plan with Sonnet 5.5 (D-162, D-170), while agy's Claude models are at their weekly limit. The integrated rev 4 review (§13 step 5) is still the driver's pick. D-155's conditions apply to P5's rework rounds.
+
+## D-176 — 2026-11-25 — Pedro: P5's rework on Opus 5.5, and the contract answers from review 1
+**Decided by Pedro (driver).** P5's review 1 asked for changes (12 findings, 52 failing tests). Pedro decided:
+1. **Writer:** Neon's usage is used up, so the rework is written by **Opus 5.5 as a Claude Code subagent on Pedro's plan**, in P5's worktree, under the same worker rules (D-123: only `cargo fmt --all` and `cargo check --workspace --tests`; never push, merge, rebase or switch branches). The review stays on Sonnet 5.5 (D-162, D-170).
+2. **§3 amended (§11 item 16):**
+   - a `~` inside a word is literal, except right after a `=` or a `:`, where shells may expand it;
+   - `>&m`/`>&-` without `n` are the same as `1>&m`/`1>&-`, with `m` in 0–2.
+
+   The orchestrator narrowed the `=`/`:` exception and the digit-only `m`, so the amendment doesn't admit a real tilde expansion or a `>&file` redirect. This means P1's lexer changes in P5.
+3. **A folder linked from inside a protected tree is protected (§11 item 17):** `ls vault/work` is HardDeny under D-145 item 3, a change against `dev`'s M1-03 finding 5.
+4. **Frozen files:** P5 may change P1, P2 and P3's files where review 1 requires it, listing each change in its handoff for the review to check:
+   - `classify_cd`'s `tool_name` (already done);
+   - CR-P5-1 in `classify_home_readonly`;
+   - the cwd after `eval`, `source` and `.` (finding 4);
+   - moving CR-P5-2's parity tests, so no kept-for-tests code is left;
+   - P1's lexer for item 2.
+
+   Public signatures stay the same unless a CR is approved. This closes CR-P5-1 and CR-P5-2 inside P5, with no D-120 exception.
+
+The orchestrator reads `grep`'s abbreviated long options (`--rec`, `--dir=recurse`) by the contract text, with no change: §6 makes unknown flags Unread, so Ask in Home and Allow under Any and FullAccess.
