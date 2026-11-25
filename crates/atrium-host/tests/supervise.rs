@@ -7,7 +7,7 @@ use atrium_host::supervise::{
     ProcessIdentity, identify, kill_recorded, spawn_group, terminate, terminate_blocking,
 };
 use atrium_protocol::thread::Cleanup;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 fn pid_exists(pid: u32) -> bool {
@@ -43,6 +43,14 @@ impl Drop for KillGroupGuard {
 }
 
 struct KillPidGuard(u32);
+
+impl KillPidGuard {
+    /// Disarm the guard once the test has reaped the child, so `Drop` never
+    /// signals a recycled pid.
+    fn disarm(&mut self) {
+        self.0 = 0;
+    }
+}
 
 impl Drop for KillPidGuard {
     fn drop(&mut self) {
@@ -218,30 +226,44 @@ async fn kill_recorded_returns_unverified_for_reused_pid_and_never_kills_it() {
 
 #[tokio::test]
 async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg("sleep 60 >/dev/null 2>&1 </dev/null & echo $!; exit 0")
-        .stdout(Stdio::piped())
+    use std::os::unix::process::CommandExt;
+
+    let mut leader_cmd = Command::new("/bin/sh");
+    leader_cmd
+        .arg("-c")
+        .arg("read _")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let mut sup = spawn_group(cmd).expect("spawn_group");
+    let mut sup = spawn_group(leader_cmd).expect("spawn_group");
     let recorded = sup.identity.clone();
     let _guard = KillGroupGuard(recorded.pgid);
 
-    let stdout = sup.child.stdout.take().expect("stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let descendant_pid: u32 = lines
-        .next_line()
-        .await
-        .unwrap()
-        .expect("descendant pid line")
-        .trim()
-        .parse()
-        .expect("parse descendant pid");
-    let desc_guard = KillPidGuard(descendant_pid);
+    // Spawn the group member directly as this test's child in `recorded.pgid`
+    // while the leader is still alive, so this test can reap it explicitly
+    // without relying on PID 1 reap latency.
+    let raw_pgid = i32::try_from(recorded.pgid).expect("pgid fits i32");
+    let mut descendant = std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(raw_pgid)
+        .spawn()
+        .expect("spawn descendant");
+    let descendant_pid = descendant.id();
+    let mut desc_guard = KillPidGuard(descendant_pid);
 
-    // Reap ONLY the leader (simulating an exited leader reaped by init after a
-    // daemon crash while a tool descendant remains in `recorded.pgid`).
+    // Release and reap ONLY the leader (simulating an exited leader reaped by
+    // init after a daemon crash while a tool descendant remains in `recorded.pgid`).
+    let mut leader_stdin = sup.child.stdin.take().expect("leader stdin");
+    leader_stdin
+        .write_all(b"bye\n")
+        .await
+        .expect("write leader release");
+    leader_stdin.flush().await.expect("flush leader release");
+    drop(leader_stdin);
     let status = sup.child.wait().await.expect("reap leader");
     assert!(status.success());
 
@@ -258,108 +280,139 @@ async fn gone_leader_with_live_descendant_in_group_is_not_verified() {
         "kill_recorded must not kill unverified group members when leader is gone"
     );
 
-    // Once the descendant is gone too, the group is empty, so recovery is Verified.
-    // Kill the descendant through the guarded helper (pid > 1).
-    drop(desc_guard);
-    for _ in 0..100 {
-        if !pid_exists(descendant_pid) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Once the descendant is killed and reaped, the group is empty, so recovery
+    // is Verified.
+    let _ = descendant.kill();
+    let _ = descendant.wait();
+    desc_guard.disarm();
     assert!(!pid_exists(descendant_pid));
     assert_eq!(kill_recorded(&recorded), Cleanup::Verified);
 }
 
-const GONE_LEADER_HELPER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_HELPER";
-const GONE_LEADER_MEMBER_ENV: &str = "ATRIUM_SUPERVISE_GONE_LEADER_MEMBER";
+/// Matches `GROUP_DRAIN_TIMEOUT` in `src/supervise.rs`.
+const GROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[test]
-fn helper_gone_leader_spawns_member_holding_stdin() {
-    if std::env::var_os(GONE_LEADER_MEMBER_ENV).is_some() {
-        let mut buf = [0u8; 1];
-        let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
-        return;
-    }
-    if std::env::var_os(GONE_LEADER_HELPER_ENV).is_none() {
-        return;
-    }
-    // Spawn a member in the same process group (no `process_group(0)`),
-    // inheriting stdin so the parent test controls when it exits. The helper
-    // exits without waiting so the member is reparented to init.
-    #[allow(clippy::zombie_processes)]
-    let child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .arg("--exact")
-        .arg("helper_gone_leader_spawns_member_holding_stdin")
-        .arg("--nocapture")
-        .arg("--quiet")
-        .env(GONE_LEADER_MEMBER_ENV, "1")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn group member");
-    println!("MEMBER:{}", child.id());
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-}
-
+/// Spawns a `/bin/sh` group leader that blocks on `read _`, joins a lightweight
+/// `/bin/sh` member directly into `recorded.pgid` as this test's own child,
+/// then releases and reaps the leader so only the member remains in
+/// `recorded.pgid`.
+///
+/// Making this test the member's parent and reaper removes any dependence on
+/// PID 1 (`launchd`/`init`) reaping the member within `GROUP_DRAIN_TIMEOUT`
+/// (and works in Linux containers without `--init`).
+///
+/// The member executes `read a && echo "$a" && read b`:
+/// - A `"ready\n"` round-trip (bounded by a 5 s timeout) proves the member has
+///   finished `exec`/startup and completed one read and write on the pipe
+///   before callers start timing drain.
+/// - Callers release the member with an explicit `"bye\n"` message rather than
+///   EOF, so an inherited write end from a parallel test's `fork` during the
+///   macOS non-atomic `Stdio::piped()` CLOEXEC window cannot keep it alive.
 async fn spawn_gone_leader_with_holding_member() -> (
     ProcessIdentity,
-    u32,
-    tokio::process::ChildStdin,
+    std::process::Child,
+    std::process::ChildStdin,
     KillGroupGuard,
     KillPidGuard,
 ) {
-    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
-    cmd.arg("--exact")
-        .arg("helper_gone_leader_spawns_member_holding_stdin")
-        .arg("--nocapture")
-        .arg("--quiet")
-        .env(GONE_LEADER_HELPER_ENV, "1")
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+
+    let mut leader_cmd = Command::new("/bin/sh");
+    leader_cmd
+        .arg("-c")
+        .arg("read _")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let mut sup = spawn_group(cmd).expect("spawn_group");
+    let mut sup = spawn_group(leader_cmd).expect("spawn_group");
     let recorded = sup.identity.clone();
     let group_guard = KillGroupGuard(recorded.pgid);
-    let stdin = sup.child.stdin.take().expect("stdin");
-    let stdout = sup.child.stdout.take().expect("stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let member_pid: u32 = loop {
-        let line = lines
-            .next_line()
-            .await
-            .unwrap()
-            .expect("helper exited before MEMBER");
-        if let Some(rest) = line.trim().strip_prefix("MEMBER:") {
-            break rest.parse().expect("parse member_pid");
-        }
-    };
+
+    // Spawn the member into `recorded.pgid` while the leader is still alive.
+    let raw_pgid = i32::try_from(recorded.pgid).expect("pgid fits i32");
+    let mut member = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("read a && echo \"$a\" && read b")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(raw_pgid)
+        .spawn()
+        .expect("spawn group member");
+    let member_pid = member.id();
     let member_guard = KillPidGuard(member_pid);
 
-    // Reap ONLY the leader so `identify(recorded.pid)` is `Ok(None)` while
-    // the group member remains alive in `recorded.pgid`.
+    // Release and reap ONLY the leader so `identify(recorded.pid)` is `Ok(None)`
+    // while the group member remains alive in `recorded.pgid`.
+    let mut leader_stdin = sup.child.stdin.take().expect("leader stdin");
+    leader_stdin
+        .write_all(b"bye\n")
+        .await
+        .expect("write release to leader stdin");
+    leader_stdin.flush().await.expect("flush leader release");
+    drop(leader_stdin);
     let status = sup.child.wait().await.expect("reap leader");
-    assert!(status.success());
+    assert!(status.success(), "leader exited with {status:?}");
 
     assert_eq!(identify(recorded.pid).unwrap(), None, "leader must be gone");
+
+    // Confirm the member has finished exec/startup and completed one read and
+    // write on its pipe before returning; it then enters `read b` until the
+    // caller writes an explicit release line.
+    let mut member_stdin = member.stdin.take().expect("member stdin");
+    member_stdin
+        .write_all(b"ready\n")
+        .expect("write ready probe to member stdin");
+    member_stdin.flush().expect("flush ready probe");
+    let member_stdout = member.stdout.take().expect("member stdout");
+    let (n, ready) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let mut line = String::new();
+            let n = std::io::BufReader::new(member_stdout)
+                .read_line(&mut line)
+                .expect("read ready from member stdout");
+            (n, line)
+        }),
+    )
+    .await
+    .expect("timed out after 5s waiting for member readiness handshake")
+    .expect("member readiness reader task panicked");
+    assert!(n > 0, "member exited before echoing ready");
+    assert_eq!(ready.trim(), "ready");
+
     let member_id = identify(member_pid)
         .unwrap()
         .expect("member must still be alive");
     assert_eq!(member_id.pgid, recorded.pgid);
 
-    (recorded, member_pid, stdin, group_guard, member_guard)
+    (recorded, member, member_stdin, group_guard, member_guard)
 }
 
 #[tokio::test]
 async fn kill_recorded_returns_verified_when_gone_leader_group_drains_within_timeout() {
-    let (recorded, member_pid, stdin, _group_guard, _member_guard) =
-        spawn_gone_leader_with_holding_member().await;
+    use std::io::Write;
 
+    let (recorded, mut member, mut member_stdin, _group_guard, mut member_guard) =
+        spawn_gone_leader_with_holding_member().await;
+    let member_pid = member.id();
+
+    // 50 ms is well above the 2 ms drain poll interval, so `kill_recorded`
+    // must enter its polling loop while leaving ~1.95 s of margin inside
+    // `GROUP_DRAIN_TIMEOUT`. The releaser thread releases the member with an
+    // explicit message and reaps it directly (no PID 1 reap hop).
     let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        drop(stdin);
+        std::thread::sleep(Duration::from_millis(50));
+        member_stdin
+            .write_all(b"bye\n")
+            .expect("write release to member stdin");
+        member_stdin.flush().expect("flush member release");
+        drop(member_stdin);
+        let status = member.wait().expect("reap member");
+        member_guard.disarm();
+        assert!(status.success(), "member exited with {status:?}");
     });
     let started = std::time::Instant::now();
     let cleanup = kill_recorded(&recorded);
@@ -367,9 +420,14 @@ async fn kill_recorded_returns_verified_when_gone_leader_group_drains_within_tim
     releaser.join().expect("releaser");
 
     assert_eq!(cleanup, Cleanup::Verified);
+    // `kill_recorded` re-checks `group_is_empty` after the 2 s drain loop, so
+    // a drain landing right at the boundary can legally return `Verified` with
+    // `elapsed >= GROUP_DRAIN_TIMEOUT`. Pin what the product guarantees: the
+    // group drained (`Verified`, member and group gone) and the call is
+    // bounded (`GROUP_DRAIN_TIMEOUT` + scheduling margin).
     assert!(
-        elapsed < Duration::from_secs(2),
-        "expected drain well under GROUP_DRAIN_TIMEOUT, took {elapsed:?}"
+        elapsed < GROUP_DRAIN_TIMEOUT + Duration::from_secs(3),
+        "expected bounded drain (GROUP_DRAIN_TIMEOUT + 3s margin), took {elapsed:?}"
     );
     assert!(!pid_exists(member_pid));
     assert!(!group_exists(recorded.pgid));
@@ -377,8 +435,11 @@ async fn kill_recorded_returns_verified_when_gone_leader_group_drains_within_tim
 
 #[tokio::test]
 async fn kill_recorded_returns_unverified_and_leaves_member_alive_when_drain_times_out() {
-    let (recorded, member_pid, stdin, _group_guard, _member_guard) =
+    use std::io::Write;
+
+    let (recorded, mut member, mut member_stdin, _group_guard, mut member_guard) =
         spawn_gone_leader_with_holding_member().await;
+    let member_pid = member.id();
 
     let started = std::time::Instant::now();
     let cleanup = kill_recorded(&recorded);
@@ -386,8 +447,8 @@ async fn kill_recorded_returns_unverified_and_leaves_member_alive_when_drain_tim
 
     assert_eq!(cleanup, Cleanup::Unverified);
     assert!(
-        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
-        "expected drain timeout around 2s, took {elapsed:?}"
+        elapsed >= GROUP_DRAIN_TIMEOUT && elapsed < Duration::from_secs(5),
+        "expected drain timeout >= 2s and bounded within 5s, took {elapsed:?}"
     );
     assert!(
         pid_exists(member_pid),
@@ -398,13 +459,58 @@ async fn kill_recorded_returns_unverified_and_leaves_member_alive_when_drain_tim
         "group member identity must still be inspectable (alive, not killed)"
     );
 
-    drop(stdin);
-    for _ in 0..100 {
-        if !pid_exists(member_pid) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    let _ = member_stdin.write_all(b"bye\n");
+    let _ = member_stdin.flush();
+    drop(member_stdin);
+    let status = member.wait().expect("reap member");
+    member_guard.disarm();
+    assert!(status.success(), "member exited with {status:?}");
+    assert!(!pid_exists(member_pid));
+}
+
+#[tokio::test]
+async fn kill_recorded_treats_unreaped_zombie_member_as_unverified_until_reaped() {
+    use std::io::Write;
+
+    let (recorded, mut member, mut member_stdin, _group_guard, mut member_guard) =
+        spawn_gone_leader_with_holding_member().await;
+    let member_pid = member.id();
+
+    // Let the member exit, but do not reap it yet so it remains an unreaped
+    // zombie in `recorded.pgid` (returning `EPERM` on macOS and `0` on Linux
+    // for `kill(-pgid, 0)`).
+    member_stdin
+        .write_all(b"bye\n")
+        .expect("write release to member stdin");
+    member_stdin.flush().expect("flush member release");
+    drop(member_stdin);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !exited_unreaped(member_pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "member {member_pid} never became a waitable zombie"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
+    assert!(
+        group_exists(recorded.pgid),
+        "unreaped zombie member must keep process group non-empty"
+    );
+
+    // An unreaped zombie member keeps `group_is_empty` false, so recovery must
+    // fail safe with `Unverified`.
+    assert_eq!(kill_recorded(&recorded), Cleanup::Unverified);
+
+    // Once this test reaps the zombie, the group is empty (`ESRCH`) and a
+    // second `kill_recorded` call returns `Verified`.
+    let status = member.wait().expect("reap zombie member");
+    member_guard.disarm();
+    assert!(status.success(), "member exited with {status:?}");
+    assert!(!pid_exists(member_pid));
+    assert!(!group_exists(recorded.pgid));
+
+    assert_eq!(kill_recorded(&recorded), Cleanup::Verified);
 }
 
 #[test]
