@@ -1173,3 +1173,13 @@ D-141 removed flag arities from these rows precisely to avoid this.
    Public signatures stay the same unless a CR is approved. This closes CR-P5-1 and CR-P5-2 inside P5, with no D-120 exception.
 
 The orchestrator reads `grep`'s abbreviated long options (`--rec`, `--dir=recurse`) by the contract text, with no change: §6 makes unknown flags Unread, so Ask in Home and Allow under Any and FullAccess.
+
+## D-177 — 2026-11-25 — Pedro: pause P5 after the D-155 rise in review 2
+**Decided by Pedro (driver).** P5's review 2 asked for changes, and its count rose from 12 to 17 (D-155 under D-175). Round 2 (Opus 5.5, partial, branch at `145667af`) gave 1084/21/1 and 2 clippy errors, with timings no better than round 1. Most of the new defects come from `dev_readings.rs`, the from-scratch port of `dev`'s payload decoding:
+- it panics on non-ASCII input;
+- it misses HardDenies `dev` gave;
+- it adds false HardDenies on ordinary lines.
+
+Review 1's findings 1 and 8 are also still open. Pedro pauses P5 to rethink the plan; the branch stays as it is. The orchestrator recommended reusing `dev`'s `shell.rs`/`words.rs` as the best-effort module instead of a rewrite. Approved now, for when P5 resumes:
+1. a `#[doc(hidden)]` test-only `SessionGate` constructor that takes the budget limits, so §13's properties 3 and 4 run through the gate. Public behaviour is unchanged, like M1-44's `with_withdraw_timeout`;
+2. remove `HOME_READONLY_COMMANDS` from `atrium-protocol` and move the table into the test fixtures (`dev_parity` or P3's), closing review 2's finding 11.
