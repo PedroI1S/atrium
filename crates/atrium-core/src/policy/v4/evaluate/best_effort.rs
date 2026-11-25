@@ -4315,6 +4315,56 @@ pub(super) fn check_search_glob_best_effort(
     }
 
     let shared = SharedSensitive::for_protected_budgeted(protected, budget)?;
+
+    // Round 2, finding 3: a selector whose last step is `..` names
+    // directories, not the files below them. Such a variant is checked as a
+    // directory (`dir_selector_hit_be`): it can only hit when it names a
+    // protected path itself, or (recursive reads) a literal root that S8
+    // covers, never home or its ancestors (§5 S8, §10 row 16; §1: an
+    // over-approximation never hits). The other variants keep the probe check.
+    let mut dir_variants: Vec<&str> = Vec::new();
+    let mut file_variants: Vec<String> = Vec::new();
+    for gv in &cands.variants {
+        budget.charge(gv.len().max(1) as u64)?;
+        if selector_ends_in_parent(gv) {
+            budget.charge_alloc(std::mem::size_of::<&str>())?;
+            dir_variants.push(gv);
+        } else {
+            file_variants.push(clone_str_budgeted(gv, budget)?);
+        }
+    }
+    if !dir_variants.is_empty() {
+        if let Some((id, probe)) = dir_selector_hit_be(
+            &dir_variants,
+            &root_strs,
+            recursive,
+            protected,
+            &shared,
+            budget,
+        )? {
+            push_be_hit(out, part, id, HitMatch::ProbeName { probe }, budget)?;
+            return Ok(());
+        }
+        if file_variants.is_empty() {
+            if cands.unknown || escaped {
+                push_charged(
+                    out,
+                    PartResult {
+                        part,
+                        outcome: PartOutcome::Unread(UnreadReason::UnsupportedFilterForm),
+                    },
+                    budget,
+                )?;
+            }
+            return Ok(());
+        }
+    }
+    let cands = GlobCandidatesBe {
+        variants: file_variants,
+        unknown: cands.unknown,
+        unbounded: cands.unbounded,
+    };
+
     let all_probes = shared.hard_deny_probes(budget)?;
     let all_store_probes = shared.store_probes(budget)?;
 
@@ -4458,6 +4508,81 @@ pub(super) fn check_search_glob_best_effort(
     }
 
     Ok(())
+}
+
+/// `true` when the selector's last step (ignoring empty and `.` components)
+/// is `..`, so it names directories rather than the files below them.
+fn selector_ends_in_parent(g: &str) -> bool {
+    g.split('/').rev().find(|c| !c.is_empty() && *c != ".") == Some("..")
+}
+
+/// Checks selectors that end in `..` (round 2, finding 3). Each variant is
+/// joined to the search roots (or expanded when anchored) and normalized; a
+/// normalized directory that still contains a glob is an over-approximation
+/// and never hits (§1). A literal directory hits when it is a protected path
+/// itself, or, for a recursive read, when S8 covers it: it isn't home, an
+/// ancestor of home or `~/.config`, and a hard-deny probe, Atrium data path
+/// or ssh-linked folder lies below it (§5 S8, §10 row 16).
+fn dir_selector_hit_be(
+    variants: &[&str],
+    root_strs: &[String],
+    recursive: bool,
+    protected: &ProtectedSet,
+    shared: &SharedSensitive,
+    budget: &mut ComputeBudget,
+) -> Result<Option<(&'static str, String)>, Exhausted> {
+    let probes = if recursive {
+        shared.hard_deny_probes(budget)?
+    } else {
+        Vec::new()
+    };
+    for gv in variants {
+        let anchored = gv.starts_with('/') || gv.starts_with('~');
+        let mut joined: Vec<String> = Vec::new();
+        if anchored {
+            joined.push(expand_home_be(gv, &protected.home, &protected.cwd, budget)?);
+        } else {
+            for r in root_strs {
+                let base = r.trim_end_matches('/');
+                let len = base.len() + 1 + gv.len();
+                budget.charge(len as u64)?;
+                budget.charge_alloc(len)?;
+                joined.push(format!("{base}/{gv}"));
+            }
+        }
+        for j in &joined {
+            let Some(norms) =
+                normalize_glob_variants_budgeted(j, MAX_SEARCH_GLOB_VARIANTS, budget)?
+            else {
+                continue;
+            };
+            for n in norms {
+                if !n.starts_with('/') || n.contains(['*', '?', '[']) {
+                    continue;
+                }
+                let folded = fold_path_listed(n.as_bytes(), protected.folds, budget)?;
+                if let Some(id) = shared.hard_deny_hit_folded(&folded, AccessMode::Read) {
+                    return Ok(Some((id, n)));
+                }
+                if !recursive || is_s8_exempt_be(&folded, shared.home_folded()) {
+                    continue;
+                }
+                for (p, id) in &probes {
+                    budget.charge(p.len().max(1) as u64)?;
+                    if under_bytes(p, &folded).is_some() {
+                        return Ok(Some((id, n)));
+                    }
+                }
+                for d in shared.ssh_linked_folded() {
+                    budget.charge(d.len().max(1) as u64)?;
+                    if under_bytes(d, &folded).is_some() {
+                        return Ok(Some(("credential-read", n)));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Default)]

@@ -869,6 +869,8 @@ pub fn gate_home() -> Tmp {
     t.write("proj_plain/a.txt", "x");
     t.write("proj/src/main.rs", "x");
     t.write("proj_atrium/a.txt", "x");
+    t.write("my_atrium_notes/a.txt", "x");
+    t.write("atrium/a.txt", "x");
     t.write(".config/atrium/config.toml", "x");
     t.write(".local/share/atrium/db", "transcripts");
     t.write("clean/src/main.rs", "x");
@@ -978,7 +980,21 @@ pub fn gate_rows() -> Vec<(&'static str, String, [&'static str; 3])> {
     }
     // reading Atrium's config is up to the preset (contract §9), also
     // through a link
-    for l in ["cat proj_atrium/*/config.toml", "cat proj_atrium/*"] {
+    for l in ["cat proj_atrium/*/config.toml", "cat proj_atrium/p*"] {
+        v.push(("K2 ordinary", l.into(), dev_glob));
+    }
+    // `proj_atrium/*` also matches `data_link`, which resolves to Atrium's data
+    // folder itself: §5 expands the glob and checks each match as a literal
+    // path by identity, and the data folder is protected for reads (§9,
+    // `policy.rs`'s `ls ~/.local/share/atrium` row): atrium-self everywhere.
+    v.push(("K2", "cat proj_atrium/*".into(), ["AS", "AS", "AS"]));
+    // Round 2, finding 3: a folder whose name merely contains `atrium` is not
+    // protected; only exact protected components are.
+    for l in [
+        "cat my_atrium_notes/*",
+        "cat atrium/*",
+        "head -n 1 my_atrium_notes/*.txt",
+    ] {
         v.push(("K2 ordinary", l.into(), dev_glob));
     }
     // K2: walkers that follow links (`cp`/`rsync` are `DerivedDestinationWriter`
@@ -1311,6 +1327,11 @@ fn fix1_p1_globstar_before_parent_dir() {
                 "src/**/../../other/*.rs",
                 "~/proj/**/..",
                 "**/..",
+                // Round 2, finding 3: selectors that reach only home itself
+                // or folders under the root; S8 exempts home (§5, §10 row 16)
+                "**/a/b/../../..",
+                "**/../.",
+                "src/../..",
             ] {
                 v.push(subject(
                     "P1 fix1",

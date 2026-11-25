@@ -914,11 +914,22 @@ fn round_5_blocker_1_searches_and_walkers_reaching_a_folder_linked_into_ssh() {
                     ));
                 }
             }
-            // D-141 / §6 / §11 item 1: `ag`, `ack`, and pathless `find` are not
-            // `Search` tools in `TOOLS`; they ask in Home (never Allow).
+            // D-141: `ag`, `ack` and `find` are unknown tools, so every word is
+            // a candidate path (§11 item 9's pattern operand covers known tools
+            // only). Inside `vault/work`, `x` and `f` name members of a folder
+            // linked from `~/.ssh`, which is protected (§11 item 17, D-145 item
+            // 3, §5's ancestor identities): HardDeny everywhere. From the
+            // ancestor `vault` they name nothing protected and ask in Home
+            // (no S8 ancestor hit: they aren't modelled as Search).
             for line in ["ag x", "ack x", "find -type f"] {
                 let d = block_on(g.gate.check(&cmd_check(line)));
-                if setting == "home" && !matches!(d, GateDecision::Ask { .. }) {
+                if cwd == "vault/work" {
+                    if !matches!(d, GateDecision::Deny { .. }) {
+                        failures.push(format!(
+                            "cwd={cwd} [{setting}] {line:?}: expected Deny (§11 item 17), got {d:?}"
+                        ));
+                    }
+                } else if setting == "home" && !matches!(d, GateDecision::Ask { .. }) {
                     failures.push(format!(
                         "cwd={cwd} [{setting}] {line:?}: expected Ask (D-141), got {d:?}"
                     ));
@@ -2117,10 +2128,19 @@ fn round_7_item_3_generated_ag_and_ack_optional_values() {
     }
     // D-141 / §6 / §11 item 1: `ag` and `ack` are deliberately omitted from
     // `TOOLS` (unknown tools); they ask in Home (never Allow) and allow under
-    // unscoped `Any` and `FullAccess`.
+    // unscoped `Any` and `FullAccess`. Run from inside `vault/work`, every
+    // word is a candidate path (D-141) naming a member of a folder linked
+    // from `~/.ssh`, which is protected (§11 item 17, D-145 item 3): HardDeny
+    // in every setting.
     for line in &deny {
         for (name, d) in gate_run(&t, line) {
-            if name == "home" && !matches!(d, GateDecision::Ask { .. }) {
+            if line.starts_with("cwd=vault/work|") {
+                if !matches!(d, GateDecision::Deny { .. }) {
+                    failures.push(format!(
+                        "[{name}] {line:?}: got {d:?}, wanted Deny (§11 item 17)"
+                    ));
+                }
+            } else if name == "home" && !matches!(d, GateDecision::Ask { .. }) {
                 failures.push(format!("[{name}] {line:?}: got {d:?}, wanted Ask (D-141)"));
             }
         }

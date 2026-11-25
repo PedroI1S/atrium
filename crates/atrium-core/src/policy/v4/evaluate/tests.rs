@@ -684,3 +684,69 @@ fn section13_properties_3_and_4_exhaustion_across_subjects_and_settings() {
         }
     }
 }
+
+/// Round 2, finding 3: a search selector whose last step is `..` names
+/// directories. Reaching only home itself (or folders under the root) is no
+/// hit: S8 exempts home (§5, §10 row 16) and an over-approximation never hits
+/// (§1). A literal protected root reached that way still hits when the read
+/// is recursive (S8), and the escape stays Unread (D-100).
+#[test]
+fn round2_finding3_parent_selectors_reaching_home_are_not_hits() {
+    use super::best_effort::check_search_glob_best_effort;
+    let mut protected = default_protected();
+    protected.cwd = b"/h/u/proj".to_vec();
+    let hits = |out: &[PartResult]| {
+        out.iter()
+            .any(|p| matches!(p.outcome, PartOutcome::HardDenyHit(_)))
+    };
+    for root in ["~/proj", "/h/u/proj"] {
+        for recursive in [true, false] {
+            for g in [
+                "**/..",
+                "~/proj/**/..",
+                "**/a/b/../../..",
+                "**/../.",
+                "src/../..",
+            ] {
+                let mut budget = ComputeBudget::with_default_limits();
+                let mut out = Vec::new();
+                check_search_glob_best_effort(
+                    &[root.to_string()],
+                    g,
+                    recursive,
+                    &protected,
+                    &mut budget,
+                    &mut out,
+                )
+                .unwrap();
+                assert!(!hits(&out), "{root} {g} recursive={recursive}: {out:?}");
+            }
+        }
+    }
+    // `~/.ssh/x/..` is `~/.ssh` itself: a recursive read of it is S8.
+    let mut budget = ComputeBudget::with_default_limits();
+    let mut out = Vec::new();
+    check_search_glob_best_effort(
+        &["/h/u/proj".to_string()],
+        "~/.ssh/x/..",
+        true,
+        &protected,
+        &mut budget,
+        &mut out,
+    )
+    .unwrap();
+    assert!(hits(&out), "{out:?}");
+    // the files-selecting neighbour is still a hit
+    let mut budget = ComputeBudget::with_default_limits();
+    let mut out = Vec::new();
+    check_search_glob_best_effort(
+        &["/h/u/proj".to_string()],
+        "**/../.ssh/id_rsa",
+        false,
+        &protected,
+        &mut budget,
+        &mut out,
+    )
+    .unwrap();
+    assert!(hits(&out), "{out:?}");
+}
