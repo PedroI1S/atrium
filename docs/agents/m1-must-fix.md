@@ -12,7 +12,7 @@ Each row below starts with its state: ✅ done (with evidence), 🟡 in progress
   - P3 (M1-39): R1–R3.
   - P5 (M1-41) re-checks every ignored test with its rev 4 verdict, and K10.
 - **Decided by §11:** S7, K7 and K9 are Unread.
-- **Done in M1-33:** F1–F4, with the batch's non-policy hunks.
+- **Done:** F1–F4 in M1-33, with the batch's non-policy hunks; F5 checked on `dev`.
 
 **Open before the M1 gate:**
 - **Rev 4:**
@@ -20,7 +20,6 @@ Each row below starts with its state: ✅ done (with evidence), 🟡 in progress
   - P2 (M1-38) and P3 (M1-39) are in rework.
   - P5 (M1-41) and the integrated rev 4 review are still to come.
 - **N16:** the bridge test flake (major).
-- **F5:** confirm M1-21's review findings against `fdabc1b8` (orchestrator).
 - **Live and manual checks:**
   - M1-08L: the live Codex checks X1–X3;
   - Pedro's macOS benches;
@@ -162,7 +161,18 @@ Rounds 3–8 worked through S2–S13 (the handoff says how each was handled); S1
 | F2 | minor | ✅ **Done in M1-33** (`c6845fb`): client batch-error logging. Was in M1-28. M1-24: `client.ts` logs only the first error in a batch. |
 | F3 | minor | ✅ **Done in M1-33** (`c6845fb`): the M1-25 export test, in its own file. Was in M1-28. M1-25: no test with a damaged message plus one still open. |
 | F4 | minor | ✅ **Done in M1-33** (`c6845fb`): withdrawals spawned together under one deadline (`drain_withdrawals`), `clear_requests` queues hook tickets for withdrawal, and the fake-provider test `claude_tool_result_without_can_use_tool_withdraws_hook_ticket_before_turn_end` (`tests/M1-28-followups.rs`). Was in M1-28. M1-26: withdrawals awaited one at a time; `clear_requests` can leak a ticket; no fake-provider `tool_result` test. |
-| F5 | — | ⬜ **Owed, orchestrator:** M1-33 took no hunk for it (contract §12), so nobody has checked it yet. Check `reviews/M1-21-demo.md` against `fdabc1b8` before the M1 gate review. Was in M1-28. M1-21: confirm every review finding was addressed in `fdabc1b8`. |
+| F5 | — | ✅ **Checked by the orchestrator (2026-11-24) on `dev`:** every finding in `reviews/M1-21-demo.md` is addressed (in `fdabc1b8` and still true after M1-23's 27-step demo):
+  1. 7b, now 7c, asserts the `invalid` / "can't be resumed" refusal as a fake-agent limit.
+  2. `run_cargo_test` requires at least N passed (2 for 6b).
+  3. Cleanup collects pids from every lock file, waits 3 s after SIGINT, then SIGKILLs, and has a SIGTERM handler.
+  4. Each check is reported as it completes, and the failure report includes `checks`.
+  5. 7a needs the Stopped note and no more assistant characters.
+  6. 6a is labelled as the toggle only, with the daemon recording notifier for the rest.
+  7. The doc mentions the real banners.
+  8. `m1-demo.ts` is loaded with a dynamic `import()`.
+  9. The doc mentions the cold build time and `lockf`.
+
+  The nits are fixed, and the doc's notes on step 7 and step 8, the Resume button and focus suppression are corrected. |
 
 ### M1-23's escalations (reopened by D-121; now in P3, M1-39)
 
