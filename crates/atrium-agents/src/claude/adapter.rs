@@ -291,12 +291,12 @@ impl AgentAdapter for ClaudeAdapter {
             let mut actor = Actor::new(
                 config,
                 options,
+                withdraw_timeout,
                 inputs,
                 descriptor.clone(),
                 events_tx,
                 commands_rx,
             )?;
-            actor.withdraw_timeout = withdraw_timeout;
             let identity = actor.launch()?;
             // If this future is dropped during the handshake, `Proc`'s drop
             // kills the whole process group.
@@ -634,9 +634,13 @@ struct Actor {
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Actor {
+    /// Single construction site for [`Actor`]: takes `withdraw_timeout`
+    /// directly (no post-construction mutation) so callers cannot silently
+    /// drop the override.
     fn new(
         config: SessionConfig,
         options: ClaudeOptions,
+        withdraw_timeout: Option<Duration>,
         inputs: DescriptorInputs,
         descriptor: EnforcementDescriptor,
         events_tx: mpsc::Sender<AgentEventEnvelope>,
@@ -661,7 +665,7 @@ impl Actor {
             gate: config.gate.clone(),
             config,
             options,
-            withdraw_timeout: None,
+            withdraw_timeout,
             norm: ClaudeNormalizer::new(),
             started: Instant::now(),
             seq: 0,
@@ -2250,6 +2254,7 @@ mod tests {
         let mut a = Actor::new(
             config,
             ClaudeOptions::default(),
+            None,
             inputs,
             descriptor,
             events_tx,
@@ -2450,39 +2455,36 @@ mod tests {
         );
     }
 
+    struct BlockingWithdrawGate {
+        started: Arc<AtomicUsize>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl ToolGate for BlockingWithdrawGate {
+        fn check<'a>(&'a self, _: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+            Box::pin(async { GateDecision::Allow })
+        }
+        fn redeem<'a>(
+            &'a self,
+            _: &'a ApprovalTicket,
+            _: &'a ToolCheck,
+        ) -> BoxFuture<'a, GateDecision> {
+            Box::pin(async { GateDecision::Allow })
+        }
+        fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+            Box::pin(async { None })
+        }
+        fn withdraw<'a>(&'a self, _: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            let mut rx = self.release.clone();
+            Box::pin(async move {
+                let _ = rx.wait_for(|v| *v).await;
+            })
+        }
+    }
+
     #[tokio::test]
     async fn withdraw_timeout_bounds_drain_without_shrinking_gate_deadline() {
-        struct BlockingWithdrawGate {
-            started: Arc<AtomicUsize>,
-            release: tokio::sync::watch::Receiver<bool>,
-        }
-        impl ToolGate for BlockingWithdrawGate {
-            fn check<'a>(&'a self, _: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
-                Box::pin(async { GateDecision::Allow })
-            }
-            fn redeem<'a>(
-                &'a self,
-                _: &'a ApprovalTicket,
-                _: &'a ToolCheck,
-            ) -> BoxFuture<'a, GateDecision> {
-                Box::pin(async { GateDecision::Allow })
-            }
-            fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
-                Box::pin(async { None })
-            }
-            fn withdraw<'a>(&'a self, _: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
-                self.started.fetch_add(1, Ordering::AcqRel);
-                let mut rx = self.release.clone();
-                Box::pin(async move {
-                    while !*rx.borrow() {
-                        if rx.changed().await.is_err() {
-                            break;
-                        }
-                    }
-                })
-            }
-        }
-
         let adapter = ClaudeAdapter::new(ClaudeOptions {
             gate_deadline: Duration::from_secs(60),
             ..ClaudeOptions::default()
@@ -2491,6 +2493,8 @@ mod tests {
         assert_eq!(adapter.options.gate_deadline, Duration::from_secs(60));
         assert_eq!(adapter.withdraw_timeout, Some(Duration::from_millis(20)));
 
+        // 1. With an explicit `withdraw_timeout`, `drain_withdrawals` detaches
+        //    after `withdraw_timeout` (20 ms) rather than `gate_deadline` (60 s).
         let started = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let mut a = actor("withdraw-timeout", &[init_line()]);
@@ -2502,13 +2506,436 @@ mod tests {
         });
         a.queue_withdraw(ApprovalTicket::new("W1".into(), false), None);
 
-        // `drain_withdrawals` must detach after `withdraw_timeout` (20 ms)
-        // rather than waiting for `gate_deadline` (60 s).
         timeout(Duration::from_secs(2), a.drain_withdrawals())
             .await
             .expect("drain_withdrawals did not honor withdraw_timeout");
         assert!(a.pending_withdrawals.is_empty());
         assert_eq!(started.load(Ordering::Acquire), 1);
         let _ = release_tx.send(true);
+
+        // 2. With no override (`withdraw_timeout = None`), `drain_withdrawals`
+        //    falls back to `options.gate_deadline` and detaches at ~20 ms.
+        let started_fb = Arc::new(AtomicUsize::new(0));
+        let (release_fb_tx, release_fb_rx) = tokio::sync::watch::channel(false);
+        let mut b = actor("withdraw-timeout-fallback", &[init_line()]);
+        b.options.gate_deadline = Duration::from_millis(20);
+        b.withdraw_timeout = None;
+        b.gate = Arc::new(BlockingWithdrawGate {
+            started: started_fb.clone(),
+            release: release_fb_rx,
+        });
+        b.queue_withdraw(ApprovalTicket::new("W2".into(), false), None);
+
+        let t0 = Instant::now();
+        timeout(Duration::from_secs(2), b.drain_withdrawals())
+            .await
+            .expect("drain_withdrawals did not fall back to gate_deadline");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(15),
+            "fallback detached too early ({elapsed:?}); expected ~20 ms gate_deadline"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "fallback stayed blocked too long ({elapsed:?}); expected ~20 ms gate_deadline"
+        );
+        assert!(b.pending_withdrawals.is_empty());
+        assert_eq!(started_fb.load(Ordering::Acquire), 1);
+        let _ = release_fb_tx.send(true);
+    }
+
+    /// Setting `with_withdraw_timeout` before `start()` must reach the running
+    /// `Actor` through the public `AgentAdapter::start` path.
+    #[tokio::test]
+    async fn with_withdraw_timeout_propagates_through_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct QuestionBlockingWithdrawGate {
+            withdraw_started: tokio::sync::watch::Sender<bool>,
+            release_withdraw: tokio::sync::watch::Receiver<bool>,
+            withdrawn: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl ToolGate for QuestionBlockingWithdrawGate {
+            fn check<'a>(&'a self, _: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+                Box::pin(async { GateDecision::Allow })
+            }
+            fn redeem<'a>(
+                &'a self,
+                _: &'a ApprovalTicket,
+                _: &'a ToolCheck,
+            ) -> BoxFuture<'a, GateDecision> {
+                Box::pin(async { GateDecision::Allow })
+            }
+            fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+                Box::pin(async { Some(ApprovalTicket::new("Q_PROP".into(), false)) })
+            }
+            fn withdraw<'a>(&'a self, ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+                self.withdrawn
+                    .lock()
+                    .unwrap()
+                    .push(ticket.request_id.clone());
+                let _ = self.withdraw_started.send(true);
+                let mut rx = self.release_withdraw.clone();
+                Box::pin(async move {
+                    let _ = rx.wait_for(|v| *v).await;
+                })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "atrium-claude-unit-{}-withdraw-propagate",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-claude-prop.py");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("2.1.308 (Claude Code)")
+    sys.exit(0)
+for line in sys.stdin:
+    v = json.loads(line)
+    t = v.get("type")
+    if t == "control_request" and v.get("request", {}).get("subtype") == "initialize":
+        print(json.dumps({"type":"control_response","response":{"subtype":"success","request_id":v["request_id"],"response":{"commands":[]}}}), flush=True)
+    elif t == "user":
+        print(json.dumps({"type":"system","subtype":"init","session_id":"s-prop","model":"m","tools":["AskUserQuestion"],"cwd":"."}), flush=True)
+        print(json.dumps({"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"tu_q1","input":{"questions":[{"question":"Q?","options":[{"label":"A"},{"label":"B"}]}]}}}), flush=True)
+    elif t == "control_response":
+        break
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (withdraw_started_tx, mut withdraw_started_rx) = tokio::sync::watch::channel(false);
+        let (release_withdraw_tx, release_withdraw_rx) = tokio::sync::watch::channel(false);
+        let withdrawn = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gate = Arc::new(QuestionBlockingWithdrawGate {
+            withdraw_started: withdraw_started_tx,
+            release_withdraw: release_withdraw_rx,
+            withdrawn: withdrawn.clone(),
+        });
+
+        let config = SessionConfig {
+            cwd: dir.clone(),
+            model: None,
+            effort: None,
+            permissions: PermissionPolicy::Ask,
+            gate,
+            mcp_servers: vec![],
+            resume: None,
+            env: vec![(
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.join("user").display().to_string(),
+            )],
+            program: Some(script),
+            on_spawn: None,
+        };
+
+        let mut session = ClaudeAdapter::new(ClaudeOptions {
+            gate_deadline: Duration::from_secs(60),
+            managed_settings: Some(vec![]),
+            ..ClaudeOptions::default()
+        })
+        .with_withdraw_timeout(Duration::from_millis(20))
+        .start(config, Transport::Local)
+        .await
+        .unwrap();
+
+        session
+            .commands
+            .send(SessionCommand::SendUserMessage { text: "go".into() })
+            .await
+            .unwrap();
+
+        let req_id = timeout(Duration::from_secs(5), async {
+            while let Some(env) = session.events.recv().await {
+                if let AgentEvent::QuestionAsked { request_id, .. } = env.event {
+                    return request_id;
+                }
+            }
+            panic!("session ended before QuestionAsked");
+        })
+        .await
+        .expect("timed out waiting for QuestionAsked");
+        assert_eq!(req_id, "Q_PROP");
+
+        session
+            .commands
+            .send(SessionCommand::DeclineQuestion { request_id: req_id })
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), withdraw_started_rx.wait_for(|v| *v))
+            .await
+            .expect("timed out waiting for gate.withdraw")
+            .unwrap();
+
+        // If `with_withdraw_timeout(20 ms)` did not propagate through `start()`,
+        // `drain_withdrawals` would block the actor loop for `gate_deadline` (60 s)
+        // and this shutdown would time out.
+        let _ = session.commands.send(SessionCommand::Shutdown).await;
+        drop(session.commands);
+        timeout(Duration::from_secs(5), async {
+            while let Some(env) = session.events.recv().await {
+                if matches!(env.event, AgentEvent::SessionEnded { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("shutdown blocked on gate_deadline instead of propagated withdraw_timeout");
+
+        assert_eq!(withdrawn.lock().unwrap().as_slice(), ["Q_PROP"]);
+        let _ = release_withdraw_tx.send(true);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `question_ticket` that resolves after `gate_deadline` must:
+    /// - deny the `AskUserQuestion` on the provider pipe with no `QuestionAsked`,
+    /// - hold the in-flight slot and permit while the late ticket call is running,
+    /// - withdraw the late ticket (`L1`) exactly once via `OrphanGuard::drop`,
+    /// - hold the permit until that withdrawal finishes.
+    #[tokio::test]
+    async fn late_question_ticket_denies_without_event_and_withdraws_orphan() {
+        struct LateQuestionGate {
+            ticket_entered: tokio::sync::watch::Sender<bool>,
+            release_ticket: tokio::sync::watch::Receiver<bool>,
+            withdraw_started: tokio::sync::watch::Sender<bool>,
+            release_withdraw: tokio::sync::watch::Receiver<bool>,
+            withdraw_finished: tokio::sync::watch::Sender<bool>,
+            withdrawn: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl ToolGate for LateQuestionGate {
+            fn check<'a>(&'a self, _: &'a ToolCheck) -> BoxFuture<'a, GateDecision> {
+                Box::pin(async { GateDecision::Allow })
+            }
+            fn redeem<'a>(
+                &'a self,
+                _: &'a ApprovalTicket,
+                _: &'a ToolCheck,
+            ) -> BoxFuture<'a, GateDecision> {
+                Box::pin(async { GateDecision::Allow })
+            }
+            fn question_ticket(&self, _: Option<u32>) -> BoxFuture<'_, Option<ApprovalTicket>> {
+                let _ = self.ticket_entered.send(true);
+                let mut rx = self.release_ticket.clone();
+                Box::pin(async move {
+                    let _ = rx.wait_for(|v| *v).await;
+                    Some(ApprovalTicket::new("L1".into(), false))
+                })
+            }
+            fn withdraw<'a>(&'a self, ticket: &'a ApprovalTicket) -> BoxFuture<'a, ()> {
+                self.withdrawn
+                    .lock()
+                    .unwrap()
+                    .push(ticket.request_id.clone());
+                let _ = self.withdraw_started.send(true);
+                let mut rx = self.release_withdraw.clone();
+                let finished = self.withdraw_finished.clone();
+                Box::pin(async move {
+                    let _ = rx.wait_for(|v| *v).await;
+                    let _ = finished.send(true);
+                })
+            }
+        }
+
+        let (ticket_entered_tx, mut ticket_entered_rx) = tokio::sync::watch::channel(false);
+        let (release_ticket_tx, release_ticket_rx) = tokio::sync::watch::channel(false);
+        let (withdraw_started_tx, mut withdraw_started_rx) = tokio::sync::watch::channel(false);
+        let (release_withdraw_tx, release_withdraw_rx) = tokio::sync::watch::channel(false);
+        let (withdraw_finished_tx, mut withdraw_finished_rx) = tokio::sync::watch::channel(false);
+        let withdrawn = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let gate = Arc::new(LateQuestionGate {
+            ticket_entered: ticket_entered_tx,
+            release_ticket: release_ticket_rx,
+            withdraw_started: withdraw_started_tx,
+            release_withdraw: release_withdraw_rx,
+            withdraw_finished: withdraw_finished_tx,
+            withdrawn: withdrawn.clone(),
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "atrium-claude-unit-{}-late-question-ticket",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config = SessionConfig {
+            cwd: dir.clone(),
+            model: None,
+            effort: None,
+            permissions: PermissionPolicy::Ask,
+            gate,
+            mcp_servers: vec![],
+            resume: None,
+            env: vec![(
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.join("user").display().to_string(),
+            )],
+            program: None,
+            on_spawn: None,
+        };
+        let inputs = DescriptorInputs {
+            cwd: dir.clone(),
+            env: config.env.clone(),
+            setting_sources: None,
+            extra_args: vec![],
+            managed: Some(vec![]),
+            version: None,
+            gate_unreachable: false,
+        };
+        let descriptor = inputs.descriptor();
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let (commands_tx, commands_rx) = mpsc::channel(8);
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::channel(8);
+
+        let mut a = Actor::new(
+            config,
+            ClaudeOptions {
+                gate_deadline: Duration::from_millis(20),
+                ..ClaudeOptions::default()
+            },
+            None,
+            inputs,
+            descriptor,
+            events_tx,
+            commands_rx,
+        )
+        .unwrap();
+        let gate_permits = a.gate_permits.clone();
+        let gate_in_flight = a.gate_in_flight.clone();
+        a.proc = Some(Proc {
+            child: None,
+            identity: ProcessIdentity {
+                pid: std::process::id(),
+                pgid: std::process::id(),
+                start_time: 0,
+                executable: PathBuf::new(),
+            },
+            stdin_tx: Some(stdin_tx),
+            writer: tokio::spawn(async {}),
+            readers: Vec::new(),
+        });
+        a.out_rx = Some(out_rx);
+
+        let actor_task = tokio::spawn(a.run());
+
+        out_tx
+            .send(Out::Stdout(init_line().to_string()))
+            .await
+            .unwrap();
+        let question = json!({
+            "type": "control_request",
+            "request_id": "c1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_late_q",
+                "input": {
+                    "questions": [{
+                        "question": "Late?",
+                        "options": [{"label": "Yes"}, {"label": "No"}]
+                    }]
+                }
+            }
+        });
+        out_tx
+            .send(Out::Stdout(question.to_string()))
+            .await
+            .unwrap();
+
+        // Wait until `question_ticket` is blocked inside the gate.
+        timeout(Duration::from_secs(2), ticket_entered_rx.wait_for(|v| *v))
+            .await
+            .expect("timed out waiting for question_ticket entry")
+            .unwrap();
+        assert_eq!(gate_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(
+            gate_permits.available_permits(),
+            MAX_IN_FLIGHT_GATE_CALLS - 1
+        );
+
+        // `gate_deadline` (20 ms) expires and denies on the provider pipe.
+        let line = timeout(Duration::from_secs(2), stdin_rx.recv())
+            .await
+            .expect("timed out waiting for deny on provider pipe")
+            .expect("provider stdin closed before deny");
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["type"], "control_response");
+        assert_eq!(reply["response"]["request_id"], "c1");
+        assert_eq!(reply["response"]["response"]["behavior"], "deny");
+
+        // No `QuestionAsked` was emitted, and both the in-flight slot and permit
+        // remain held while the timed-out `question_ticket` is still running.
+        while let Ok(env) = events_rx.try_recv() {
+            assert!(
+                !matches!(env.event, AgentEvent::QuestionAsked { .. }),
+                "unexpected QuestionAsked after timeout: {:?}",
+                env.event
+            );
+        }
+        assert_eq!(gate_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(
+            gate_permits.available_permits(),
+            MAX_IN_FLIGHT_GATE_CALLS - 1
+        );
+
+        // Release the late ticket: `OrphanGuard::drop` queues `L1` for withdrawal
+        // and keeps the permit held until `gate.withdraw` completes.
+        let _ = release_ticket_tx.send(true);
+        timeout(Duration::from_secs(2), withdraw_started_rx.wait_for(|v| *v))
+            .await
+            .expect("timed out waiting for late-ticket withdrawal")
+            .unwrap();
+        assert_eq!(withdrawn.lock().unwrap().as_slice(), ["L1"]);
+        assert_eq!(
+            gate_permits.available_permits(),
+            MAX_IN_FLIGHT_GATE_CALLS - 1,
+            "permit must stay held until late-ticket withdrawal finishes"
+        );
+
+        // Release the withdrawal and verify the permit and in-flight slot clear.
+        let _ = release_withdraw_tx.send(true);
+        timeout(
+            Duration::from_secs(2),
+            withdraw_finished_rx.wait_for(|v| *v),
+        )
+        .await
+        .expect("timed out waiting for withdrawal to finish")
+        .unwrap();
+        let all_permits = timeout(
+            Duration::from_secs(2),
+            gate_permits.acquire_many(MAX_IN_FLIGHT_GATE_CALLS as u32),
+        )
+        .await
+        .expect("permit was not released after late-ticket withdrawal finished")
+        .unwrap();
+        drop(all_permits);
+        assert_eq!(gate_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(withdrawn.lock().unwrap().as_slice(), ["L1"]);
+
+        drop(commands_tx);
+        drop(out_tx);
+        timeout(Duration::from_secs(2), actor_task)
+            .await
+            .expect("actor did not shut down cleanly")
+            .unwrap();
+        while let Some(env) = events_rx.recv().await {
+            assert!(
+                !matches!(env.event, AgentEvent::QuestionAsked { .. }),
+                "unexpected QuestionAsked before shutdown: {:?}",
+                env.event
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
