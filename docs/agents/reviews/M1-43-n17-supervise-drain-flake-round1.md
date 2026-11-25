@@ -68,3 +68,10 @@ The handoff overstates how well the cause is proven, its repro is wrong, and its
 - No test checks that `member_pid` is `cat` (finding 5).
 - The Unverified test's `elapsed < 3 s` upper bound was untouched. It is still a load-sensitive edge, with 1 s of slack over 2 ms sleeps. It is separate from N17 but worth watching in the load runs.
 
+
+## Orchestrator's before/after run (answers the first test gap)
+Same machine and the same load: 20 `yes` CPU hogs, load average 15 to 39.
+- **`dev`, the old test:** `supervise` ×100 had **2 failures**, each one test in a 2.02 s run, which is the drain timeout.
+- **M1-43, the fixed test:** ×100 had **0 failures**.
+
+Modest evidence that the fix lowers the failure rate. Linux has not been run.
